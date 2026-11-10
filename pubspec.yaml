@@ -1,0 +1,33 @@
+name: message_mail
+description: "5 km Decentralized Off-Grid Message Mail App"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  sqflite: ^2.3.0
+  path: ^1.9.0
+  path_provider: ^2.1.2
+  flutter_blue_plus: ^1.34.0
+  record: ^5.1.2
+  audioplayers: ^6.0.0
+  provider: ^6.1.2
+  uuid: ^4.4.0
+  permission_handler: ^11.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  sqflite_common_ffi: ^2.3.0
+
+dependency_overrides:
+  record_platform_interface: 1.2.0
+
+flutter:
+  uses-material-design: true
