@@ -1,23 +1,21 @@
 /*
  * =========================================================================================
- * 5 km Decentralized Off-Grid "Message Mail" - ESP32 DEVKIT V1 Edition
+ * Off-Grid Decentralized "Message Mail" Relay Firmware (Protocol v2)
+ * Hardware Target: DOIT ESP32 DEVKIT V1 (ESP-WROOM-32)
+ * Framework: Arduino IDE (ESP32 Arduino Core 3.0+) / PlatformIO
  *
- * Board: DOIT ESP32 DEVKIT V1 (ESP-WROOM-32)
- * Framework: Arduino IDE / PlatformIO
- * 
- * Hardware Details:
- *   - ESP32 Dual-Core @ 240MHz, 520KB SRAM
- *   - Built-in Bluetooth Low Energy (BLE 4.2)
- *   - Onboard Status LED: GPIO 2 (Blue LED)
- *       * Blinking: Waiting for Mobile Connection (Advertising)
- *       * Solid ON: Connected to Mobile Phone
- *       * Rapid Strobe: Transmitting / Receiving Message Mail
+ * Features:
+ *   1. Zero-Touch Multi-Client BLE GATT Server (up to 8 concurrent phones)
+ *   2. Persistent Unique Username Registry (LittleFS /peers.dat) + Collision Detection
+ *   3. Private 1-to-1 Unicast Routing (targets exact conn_id, no broadcast leaks)
+ *   4. Group Chat Fan-out & Persistent Group Directory (/groups.dat)
+ *   5. Persistent Store-and-Forward LittleFS Mailbox (/mb/) supporting chunked Voice Notes
+ *   6. Zero-Latency RAM Pass-Through for Live Voice Calling + Instant Offline Detection
  *
- * Communication Architecture:
- *   - 100% Off-Grid, Zero-Backend, No Wi-Fi router, No SIM card
- *   - BLE Service UUID: 0000a101-0000-1000-8000-00805f9b34fb
- *   - TX Char (Phone -> ESP32 Write Without Response): 0000a102-0000-1000-8000-00805f9b34fb
- *   - RX Char (ESP32 -> Phone Notify): 0000a103-0000-1000-8000-00805f9b34fb
+ * Onboard Status LED (GPIO 2):
+ *   - Slow Blink (600ms) : Advertising, waiting for clients
+ *   - Solid ON           : At least 1 phone connected
+ *   - Rapid Strobe       : Active packet relay
  * =========================================================================================
  */
 
@@ -26,241 +24,1029 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <LittleFS.h>
+#include <esp_gatts_api.h>
 
-// Onboard Blue LED on ESP32 DevKit V1
 #define STATUS_LED          2
-
-// GATT Service & Characteristic UUIDs matching the Flutter App
 #define SERVICE_UUID        "0000a101-0000-1000-8000-00805f9b34fb"
 #define CHAR_DATA_TX_UUID   "0000a102-0000-1000-8000-00805f9b34fb"
 #define CHAR_DATA_RX_UUID   "0000a103-0000-1000-8000-00805f9b34fb"
 
-#define NODE_NAME           "NODE-P1" // Device name discovered by phone
-#define HEADER_LENGTH       27
-#define MAX_PAYLOAD_SIZE    1024
-#define MAX_QUEUE_ITEMS     30
+#define NODE_NAME           "OFFGRID-RELAY"
+#define PROTO_VER_V2        0x02
+#define MIN_HEADER_V2       23
+#define MAX_ID_LEN          24
+#define MAX_PACKET_SIZE     512
+
+// Packet Types
+#define PKT_TEXT_MSG        0x01
+#define PKT_VOICE_CHUNK     0x02
+#define PKT_DELIVERY_ACK    0x03
+#define PKT_SYNC_POLL       0x04
+#define PKT_PRESENCE_HELLO  0x05
+#define PKT_PEER_DIRECTORY  0x06
+#define PKT_GROUP_META      0x07
+#define PKT_CALL_SIGNAL     0x08
+#define PKT_CALL_AUDIO      0x09
+
+// Flags bitmask
+#define FLAG_GROUP          0x01
+#define FLAG_CHUNKED        0x02
+#define FLAG_COMPRESSED     0x04
+#define FLAG_STATUS_FAIL    0x08
+
+// Call Signals
+#define CALL_SIG_INVITE       0x01
+#define CALL_SIG_RINGING      0x02
+#define CALL_SIG_ACCEPT       0x03
+#define CALL_SIG_REJECT       0x04
+#define CALL_SIG_BUSY         0x05
+#define CALL_SIG_UNAVAILABLE  0x06
+#define CALL_SIG_HANGUP       0x07
+#define CALL_SIG_VOICEMAIL    0x08
+
+// Capacity limits
+#define MAX_CLIENTS         8
+#define MAX_PEERS           40
+#define MAX_GROUPS          20
+#define MAX_GROUP_MEMBERS   16
+#define MAX_MAILBOX_FILES   160
+#define RX_RING_SIZE        32
 
 BLEServer* pServer = nullptr;
 BLECharacteristic* pTxCharacteristic = nullptr;
 BLECharacteristic* pRxCharacteristic = nullptr;
+esp_gatt_if_t g_gatts_if = ESP_GATT_IF_NONE;
 
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
+void onCustomGattsEvent(
+  esp_gatts_cb_event_t event,
+  esp_gatt_if_t gatts_if,
+  esp_ble_gatts_cb_param_t* param
+);
+
 unsigned long lastLedBlink = 0;
 bool ledState = false;
+bool fsReady = false;
+uint32_t nextMailSeq = 1;
+bool pendingDirectoryBroadcast = false;
 
-// Store-and-Forward In-Memory Mailbox Structure
-struct MailboxMessage {
-  uint8_t uuid[16];
-  uint8_t payloadType; // 0x01 = Text, 0x02 = Voice Note, 0x03 = Delivery ACK
-  char recipient[9];
-  uint16_t length;
-  uint8_t payload[MAX_PAYLOAD_SIZE];
-  bool isBuffered;
+// Active BLE Session Table
+struct ClientSession {
+  bool active;
+  uint16_t connId;
+  char username[MAX_ID_LEN + 1];
+  bool registered;
 };
+ClientSession sessions[MAX_CLIENTS];
 
-MailboxMessage mailbox[MAX_QUEUE_ITEMS];
-int mailboxCount = 0;
+// Persistent Unique Peer Registry (/peers.dat)
+struct PeerRecord {
+  bool active;
+  uint8_t deviceUuid[16];
+  char username[MAX_ID_LEN + 1];
+  char displayName[33];
+};
+PeerRecord peers[MAX_PEERS];
 
-// Function Prototypes
-void sendDeliveryAck(const uint8_t* messageUuid, const char* recipient);
-void pushBufferedMailToPhone();
-void strobeLed(int times, int delayMs);
+// Persistent Group Membership Table (/groups.dat)
+struct GroupRecord {
+  bool active;
+  char groupId[MAX_ID_LEN + 1];
+  uint8_t memberCount;
+  char members[MAX_GROUP_MEMBERS][MAX_ID_LEN + 1];
+};
+GroupRecord groups[MAX_GROUPS];
 
-// BLE Server Connection Callbacks
-class DevKitServerCallbacks: public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) override {
-    deviceConnected = true;
-    digitalWrite(STATUS_LED, HIGH); // Solid ON when mobile phone is connected
-    Serial.printf("\n[BLE] >>> Mobile phone paired! Total clients connected: %d\n", pServer->getConnectedCount());
-    // Keep advertising beacon active so another phone can connect for real-time mesh chat!
-    pServer->startAdvertising();
+// Thread-safe RX Ring Buffer (decouples BLE stack callback from LittleFS I/O)
+struct RxFrame {
+  uint16_t connId;
+  uint16_t len;
+  uint8_t data[MAX_PACKET_SIZE];
+};
+RxFrame rxRing[RX_RING_SIZE];
+volatile int rxHead = 0;
+volatile int rxTail = 0;
+portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ============================================================================
+// Helper Utilities
+// ============================================================================
+
+void strobeLed(int times, int delayMs) {
+  int connectedCount = 0;
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (sessions[i].active) connectedCount++;
+  }
+  for (int i = 0; i < times; i++) {
+    digitalWrite(STATUS_LED, HIGH);
+    delay(delayMs);
+    digitalWrite(STATUS_LED, LOW);
+    delay(delayMs);
+  }
+  digitalWrite(STATUS_LED, connectedCount > 0 ? HIGH : LOW);
+}
+
+int getActiveSessionCount() {
+  int cnt = 0;
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (sessions[i].active) cnt++;
+  }
+  return cnt;
+}
+
+int findSessionByConnId(uint16_t connId) {
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (sessions[i].active && sessions[i].connId == connId) return i;
+  }
+  return -1;
+}
+
+int findSessionByUsername(const char* username) {
+  if (!username || username[0] == '\0') return -1;
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (sessions[i].active && sessions[i].registered &&
+        strcmp(sessions[i].username, username) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int findPeerByUsername(const char* username) {
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (peers[i].active && strcmp(peers[i].username, username) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int findGroupById(const char* groupId) {
+  for (int i = 0; i < MAX_GROUPS; i++) {
+    if (groups[i].active && strcmp(groups[i].groupId, groupId) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// Captures the active GATTS interface handle without accessing private BLEServer members
+void onCustomGattsEvent(
+  esp_gatts_cb_event_t event,
+  esp_gatt_if_t gatts_if,
+  esp_ble_gatts_cb_param_t* param
+) {
+  if (event == ESP_GATTS_REG_EVT && param && param->reg.status == ESP_GATT_OK) {
+    g_gatts_if = gatts_if;
+  } else if (g_gatts_if == ESP_GATT_IF_NONE && gatts_if != ESP_GATT_IF_NONE) {
+    g_gatts_if = gatts_if;
+  }
+}
+
+// Send raw BLE notification directly to ONE specific client conn_id
+bool sendToConnId(uint16_t connId, const uint8_t* data, size_t len) {
+  if (pServer == nullptr || pRxCharacteristic == nullptr ||
+      g_gatts_if == ESP_GATT_IF_NONE || len == 0 || len > MAX_PACKET_SIZE) {
+    return false;
+  }
+  esp_err_t err = esp_ble_gatts_send_indicate(
+    g_gatts_if,
+    connId,
+    pRxCharacteristic->getHandle(),
+    len,
+    (uint8_t*)data,
+    false // false = Notification (fast, non-blocking)
+  );
+  return err == ESP_OK;
+}
+
+// Build a Protocol v2 binary frame
+size_t buildV2Packet(
+  uint8_t* outBuf,
+  uint8_t pktType,
+  const uint8_t* msgUuid,
+  const char* senderId,
+  const char* targetId,
+  uint8_t flags,
+  const uint8_t* payload,
+  uint16_t payloadLen
+) {
+  uint8_t sLen = senderId ? (uint8_t)min((size_t)MAX_ID_LEN, strlen(senderId)) : 0;
+  uint8_t tLen = targetId ? (uint8_t)min((size_t)MAX_ID_LEN, strlen(targetId)) : 0;
+  size_t total = MIN_HEADER_V2 + sLen + tLen + payloadLen;
+  if (total > MAX_PACKET_SIZE) return 0;
+
+  outBuf[0] = PROTO_VER_V2;
+  outBuf[1] = pktType;
+  if (msgUuid) {
+    memcpy(&outBuf[2], msgUuid, 16);
+  } else {
+    memset(&outBuf[2], 0, 16);
+  }
+  outBuf[18] = sLen;
+  outBuf[19] = tLen;
+  outBuf[20] = flags;
+  outBuf[21] = (payloadLen >> 8) & 0xFF;
+  outBuf[22] = payloadLen & 0xFF;
+
+  size_t offset = MIN_HEADER_V2;
+  if (sLen > 0) {
+    memcpy(&outBuf[offset], senderId, sLen);
+    offset += sLen;
+  }
+  if (tLen > 0) {
+    memcpy(&outBuf[offset], targetId, tLen);
+    offset += tLen;
+  }
+  if (payloadLen > 0 && payload != nullptr) {
+    memcpy(&outBuf[offset], payload, payloadLen);
+    offset += payloadLen;
+  }
+  return offset;
+}
+
+// ============================================================================
+// Persistent LittleFS Storage (/peers.dat, /groups.dat, /mb/*)
+// ============================================================================
+
+void savePeersToFS() {
+  if (!fsReady) return;
+  File f = LittleFS.open("/peers.dat", "w");
+  if (!f) return;
+  f.write((const uint8_t*)peers, sizeof(peers));
+  f.close();
+}
+
+void loadPeersFromFS() {
+  memset(peers, 0, sizeof(peers));
+  if (!fsReady || !LittleFS.exists("/peers.dat")) return;
+  File f = LittleFS.open("/peers.dat", "r");
+  if (!f) return;
+  if (f.size() == sizeof(peers)) {
+    f.read((uint8_t*)peers, sizeof(peers));
+  }
+  f.close();
+}
+
+void saveGroupsToFS() {
+  if (!fsReady) return;
+  File f = LittleFS.open("/groups.dat", "w");
+  if (!f) return;
+  f.write((const uint8_t*)groups, sizeof(groups));
+  f.close();
+}
+
+void loadGroupsFromFS() {
+  memset(groups, 0, sizeof(groups));
+  if (!fsReady || !LittleFS.exists("/groups.dat")) return;
+  File f = LittleFS.open("/groups.dat", "r");
+  if (!f) return;
+  if (f.size() == sizeof(groups)) {
+    f.read((uint8_t*)groups, sizeof(groups));
+  }
+  f.close();
+}
+
+void initMailboxDir() {
+  if (!fsReady) return;
+  if (!LittleFS.exists("/mb")) {
+    LittleFS.mkdir("/mb");
+  }
+  // Find max sequence ID
+  File root = LittleFS.open("/mb");
+  if (root && root.isDirectory()) {
+    File file = root.openNextFile();
+    while (file) {
+      String name = String(file.name());
+      int slash = name.lastIndexOf('/');
+      String base = slash >= 0 ? name.substring(slash + 1) : name;
+      uint32_t seq = (uint32_t)base.toInt();
+      if (seq >= nextMailSeq) nextMailSeq = seq + 1;
+      file = root.openNextFile();
+    }
+    root.close();
+  }
+}
+
+void pruneOldestMailboxIfNeeded() {
+  if (!fsReady) return;
+  int count = 0;
+  String oldestPath = "";
+  uint32_t oldestSeq = 0xFFFFFFFF;
+
+  File root = LittleFS.open("/mb");
+  if (!root || !root.isDirectory()) return;
+  File file = root.openNextFile();
+  while (file) {
+    count++;
+    String name = String(file.name());
+    int slash = name.lastIndexOf('/');
+    String base = slash >= 0 ? name.substring(slash + 1) : name;
+    uint32_t seq = (uint32_t)base.toInt();
+    if (seq < oldestSeq) {
+      oldestSeq = seq;
+      oldestPath = name.startsWith("/mb") ? name : ("/mb/" + base);
+    }
+    file = root.openNextFile();
+  }
+  root.close();
+
+  if (count >= MAX_MAILBOX_FILES && oldestPath.length() > 0) {
+    LittleFS.remove(oldestPath);
+    Serial.printf("[MAILBOX] Pruned oldest item %s (queue limit %d)\n", oldestPath.c_str(), MAX_MAILBOX_FILES);
+  }
+}
+
+// Stored mailbox file format:
+// [0] recipientCount (1 byte)
+// [1..] recipientCount * 25-byte null-terminated strings
+// [..] uint16_t rawFrameLen
+// [..] rawFrameBytes
+void storeOfflinePacket(const char recipients[][MAX_ID_LEN + 1], int recipientCount, const uint8_t* frame, uint16_t frameLen) {
+  if (!fsReady || recipientCount <= 0 || frameLen == 0) return;
+  pruneOldestMailboxIfNeeded();
+
+  char path[32];
+  snprintf(path, sizeof(path), "/mb/%08lu.pkt", (unsigned long)nextMailSeq++);
+  File f = LittleFS.open(path, "w");
+  if (!f) return;
+
+  uint8_t count = (uint8_t)min(recipientCount, MAX_GROUP_MEMBERS);
+  f.write(&count, 1);
+  for (int i = 0; i < count; i++) {
+    uint8_t recBuf[MAX_ID_LEN + 1];
+    memset(recBuf, 0, sizeof(recBuf));
+    strncpy((char*)recBuf, recipients[i], MAX_ID_LEN);
+    f.write(recBuf, MAX_ID_LEN + 1);
+  }
+  uint8_t lenBuf[2] = { (uint8_t)((frameLen >> 8) & 0xFF), (uint8_t)(frameLen & 0xFF) };
+  f.write(lenBuf, 2);
+  f.write(frame, frameLen);
+  f.close();
+
+  Serial.printf("[MAILBOX] Stored %s for %d offline recipient(s) (%d bytes)\n", path, count, frameLen);
+}
+
+// Delivers ONLY stored packets addressed to `username` and deletes them once delivered
+void deliverOfflineMailboxForUser(uint16_t connId, const char* username) {
+  if (!fsReady || !username || username[0] == '\0') return;
+
+  // Store integer sequence numbers on stack (only ~640 bytes) so loopTask stack stays safe
+  uint32_t seqList[MAX_MAILBOX_FILES];
+  int matchCount = 0;
+
+  File root = LittleFS.open("/mb");
+  if (!root || !root.isDirectory()) return;
+
+  File file = root.openNextFile();
+  while (file && matchCount < MAX_MAILBOX_FILES) {
+    String name = String(file.name());
+    int slash = name.lastIndexOf('/');
+    String base = slash >= 0 ? name.substring(slash + 1) : name;
+    uint32_t seq = (uint32_t)base.toInt();
+    if (seq > 0) {
+      seqList[matchCount++] = seq;
+    }
+    file = root.openNextFile();
+  }
+  root.close();
+
+  // Sort ascending so messages arrive chronologically
+  for (int i = 0; i < matchCount - 1; i++) {
+    for (int j = i + 1; j < matchCount; j++) {
+      if (seqList[j] < seqList[i]) {
+        uint32_t tmp = seqList[i];
+        seqList[i] = seqList[j];
+        seqList[j] = tmp;
+      }
+    }
   }
 
-  void onDisconnect(BLEServer* pServer) override {
-    uint32_t count = pServer->getConnectedCount();
-    if (count == 0) {
-      deviceConnected = false;
-      digitalWrite(STATUS_LED, LOW);
-      Serial.println("\n[BLE] <<< All mobile phones disconnected. Resuming advertising beacon...");
-    } else {
-      Serial.printf("\n[BLE] <<< A phone disconnected. %d phone(s) still connected.\n", count);
+  int delivered = 0;
+  char pathBuf[32];
+  for (int i = 0; i < matchCount; i++) {
+    snprintf(pathBuf, sizeof(pathBuf), "/mb/%08lu.pkt", (unsigned long)seqList[i]);
+    File f = LittleFS.open(pathBuf, "r");
+    if (!f) continue;
+
+    uint8_t count = 0;
+    if (f.read(&count, 1) != 1 || count == 0 || count > MAX_GROUP_MEMBERS) {
+      f.close();
+      LittleFS.remove(pathBuf);
+      continue;
     }
-    pServer->startAdvertising();
+
+    char recList[MAX_GROUP_MEMBERS][MAX_ID_LEN + 1];
+    bool isForUser = false;
+    for (int r = 0; r < count; r++) {
+      memset(recList[r], 0, MAX_ID_LEN + 1);
+      f.read((uint8_t*)recList[r], MAX_ID_LEN + 1);
+      recList[r][MAX_ID_LEN] = '\0';
+      if (strcmp(recList[r], username) == 0) {
+        isForUser = true;
+      }
+    }
+
+    if (!isForUser) {
+      f.close();
+      continue;
+    }
+
+    uint8_t lenBuf[2];
+    if (f.read(lenBuf, 2) != 2) {
+      f.close();
+      continue;
+    }
+    uint16_t frameLen = ((uint16_t)lenBuf[0] << 8) | lenBuf[1];
+    if (frameLen == 0 || frameLen > MAX_PACKET_SIZE) {
+      f.close();
+      LittleFS.remove(pathBuf);
+      continue;
+    }
+
+    uint8_t frame[MAX_PACKET_SIZE];
+    size_t got = f.read(frame, frameLen);
+    f.close();
+
+    if (got == frameLen) {
+      if (sendToConnId(connId, frame, frameLen)) {
+        delivered++;
+        delay(18); // Gentle pacing so BLE queue never drops multi-chunk voice notes
+
+        // Remove this user from pending recipient list
+        char remaining[MAX_GROUP_MEMBERS][MAX_ID_LEN + 1];
+        int remCount = 0;
+        for (int r = 0; r < count; r++) {
+          if (strcmp(recList[r], username) != 0) {
+            strncpy(remaining[remCount], recList[r], MAX_ID_LEN);
+            remaining[remCount][MAX_ID_LEN] = '\0';
+            remCount++;
+          }
+        }
+
+        if (remCount == 0) {
+          LittleFS.remove(pathBuf);
+        } else {
+          File wf = LittleFS.open(pathBuf, "w");
+          if (wf) {
+            uint8_t rc = (uint8_t)remCount;
+            wf.write(&rc, 1);
+            for (int r = 0; r < remCount; r++) {
+              wf.write((const uint8_t*)remaining[r], MAX_ID_LEN + 1);
+            }
+            wf.write(lenBuf, 2);
+            wf.write(frame, frameLen);
+            wf.close();
+          }
+        }
+      }
+    }
   }
-};
 
-// BLE Characteristic TX Callbacks (Receives message mail packets from phone)
-class DevKitTxCallbacks: public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pCharacteristic) override {
-    String rxData = pCharacteristic->getValue();
-    size_len_check:
-    size_t len = rxData.length();
+  if (delivered > 0) {
+    Serial.printf("[MAILBOX] Synced %d buffered packet(s) to '%s'\n", delivered, username);
+  }
+}
 
-    if (len < HEADER_LENGTH) {
-      Serial.printf("[BLE] Warning: Frame too short (%d bytes, min %d)\n", len, HEADER_LENGTH);
-      return;
+// ============================================================================
+// Peer Directory Broadcast
+// ============================================================================
+
+void sendPeerDirectoryToConn(uint16_t connId) {
+  int totalPeers = 0;
+  int peerIndices[MAX_PEERS];
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (peers[i].active) {
+      peerIndices[totalPeers++] = i;
+    }
+  }
+
+  if (totalPeers == 0) return;
+
+  // Paginate up to 8 peers per packet so payload stays well under BLE MTU
+  const int PER_PAGE = 8;
+  uint8_t totalPages = (uint8_t)((totalPeers + PER_PAGE - 1) / PER_PAGE);
+
+  for (uint8_t page = 0; page < totalPages; page++) {
+    uint8_t payload[420];
+    size_t pOff = 0;
+    payload[pOff++] = page;
+    payload[pOff++] = totalPages;
+
+    int startIdx = page * PER_PAGE;
+    int endIdx = min(startIdx + PER_PAGE, totalPeers);
+    payload[pOff++] = (uint8_t)(endIdx - startIdx);
+
+    for (int k = startIdx; k < endIdx; k++) {
+      PeerRecord& pr = peers[peerIndices[k]];
+      uint8_t uLen = (uint8_t)strlen(pr.username);
+      uint8_t dLen = (uint8_t)strlen(pr.displayName);
+      if (pOff + 3 + uLen + dLen >= sizeof(payload)) break;
+
+      payload[pOff++] = uLen;
+      memcpy(&payload[pOff], pr.username, uLen);
+      pOff += uLen;
+
+      payload[pOff++] = dLen;
+      memcpy(&payload[pOff], pr.displayName, dLen);
+      pOff += dLen;
+
+      bool online = (findSessionByUsername(pr.username) >= 0);
+      payload[pOff++] = online ? 0x01 : 0x00;
     }
 
-    strobeLed(3, 40); // Flash LED to indicate packet reception
-    const uint8_t* bytes = (const uint8_t*)rxData.c_str();
-
-    // 1. Parse 16-byte Message UUID
-    char uuidStr[37];
-    snprintf(uuidStr, sizeof(uuidStr), 
-      "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-      bytes[0], bytes[1], bytes[2], bytes[3],
-      bytes[4], bytes[5], bytes[6], bytes[7],
-      bytes[8], bytes[9], bytes[10], bytes[11],
-      bytes[12], bytes[13], bytes[14], bytes[15]
+    uint8_t frame[MAX_PACKET_SIZE];
+    size_t fLen = buildV2Packet(
+      frame,
+      PKT_PEER_DIRECTORY,
+      nullptr,
+      "RELAY",
+      "ALL",
+      0x00,
+      payload,
+      (uint16_t)pOff
     );
+    if (fLen > 0) {
+      sendToConnId(connId, frame, fLen);
+      delay(12);
+    }
+  }
+}
 
-    // 2. Parse Payload Type Flag
-    uint8_t payloadType = bytes[16];
+void broadcastPeerDirectoryToAll() {
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (sessions[i].active && sessions[i].registered) {
+      sendPeerDirectoryToConn(sessions[i].connId);
+    }
+  }
+}
 
-    // 3. Parse Recipient ID (8 bytes)
-    char recipientId[9];
-    memset(recipientId, 0, sizeof(recipientId));
-    memcpy(recipientId, &bytes[17], 8);
+// ============================================================================
+// Protocol v2 Packet Processor
+// ============================================================================
 
-    // 4. Parse Payload Length (Big Endian uint16)
-    uint16_t payloadLen = ((uint16_t)bytes[25] << 8) | (uint16_t)bytes[26];
+void routePacketToTargets(
+  const char targets[][MAX_ID_LEN + 1],
+  int targetCount,
+  const uint8_t* rawFrame,
+  uint16_t rawLen,
+  bool storeIfOffline
+) {
+  char offlineList[MAX_GROUP_MEMBERS][MAX_ID_LEN + 1];
+  int offlineCount = 0;
 
-    // Handle SYNC POLL command (0x04)
-    if (payloadType == 0x04) {
-      Serial.println("[BLE] >>> Received SYNC POLL from phone. Pushing buffered mailbox...");
-      pushBufferedMailToPhone();
+  for (int i = 0; i < targetCount; i++) {
+    int sessIdx = findSessionByUsername(targets[i]);
+    if (sessIdx >= 0) {
+      sendToConnId(sessions[sessIdx].connId, rawFrame, rawLen);
+    } else if (storeIfOffline && offlineCount < MAX_GROUP_MEMBERS) {
+      strncpy(offlineList[offlineCount], targets[i], MAX_ID_LEN);
+      offlineList[offlineCount][MAX_ID_LEN] = '\0';
+      offlineCount++;
+    }
+  }
+
+  if (storeIfOffline && offlineCount > 0) {
+    storeOfflinePacket(offlineList, offlineCount, rawFrame, rawLen);
+  }
+}
+
+void processIncomingFrame(const RxFrame& rf) {
+  if (rf.len < MIN_HEADER_V2) return;
+  const uint8_t* b = rf.data;
+
+  if (b[0] != PROTO_VER_V2) {
+    Serial.printf("[PROTO] Ignored non-v2 frame (ver=0x%02X)\n", b[0]);
+    return;
+  }
+
+  uint8_t pktType = b[1];
+  const uint8_t* msgUuid = &b[2];
+  uint8_t sLen = b[18];
+  uint8_t tLen = b[19];
+  uint8_t flags = b[20];
+  uint16_t pLen = ((uint16_t)b[21] << 8) | b[22];
+
+  if (sLen > MAX_ID_LEN || tLen > MAX_ID_LEN) return;
+  size_t expectedLen = MIN_HEADER_V2 + sLen + tLen + pLen;
+  if (rf.len < expectedLen) {
+    Serial.printf("[PROTO] Truncated frame: got %d, expected %d\n", rf.len, expectedLen);
+    return;
+  }
+
+  char senderId[MAX_ID_LEN + 1];
+  char targetId[MAX_ID_LEN + 1];
+  memset(senderId, 0, sizeof(senderId));
+  memset(targetId, 0, sizeof(targetId));
+  if (sLen > 0) memcpy(senderId, &b[MIN_HEADER_V2], sLen);
+  if (tLen > 0) memcpy(targetId, &b[MIN_HEADER_V2 + sLen], tLen);
+  const uint8_t* payload = &b[MIN_HEADER_V2 + sLen + tLen];
+
+  // Fast path: Live Call Audio Frame (zero Flash I/O, zero LED delay)
+  if (pktType == PKT_CALL_AUDIO) {
+    int sessIdx = findSessionByUsername(targetId);
+    if (sessIdx >= 0) {
+      sendToConnId(sessions[sessIdx].connId, rf.data, rf.len);
+    }
+    return;
+  }
+
+  // Fast path: Call Signaling (INVITE, RINGING, ACCEPT, REJECT, BUSY, HANGUP)
+  if (pktType == PKT_CALL_SIGNAL) {
+    uint8_t sigCode = pLen > 0 ? payload[0] : 0;
+    int targetSess = findSessionByUsername(targetId);
+    Serial.printf("[CALL] Signal 0x%02X: %s -> %s (online=%d)\n", sigCode, senderId, targetId, targetSess >= 0 ? 1 : 0);
+
+    if (targetSess >= 0) {
+      if (!sendToConnId(sessions[targetSess].connId, rf.data, rf.len)) {
+        delay(4);
+        sendToConnId(sessions[targetSess].connId, rf.data, rf.len);
+      }
+    } else if (sigCode == CALL_SIG_INVITE) {
+      // Callee is not connected to relay right now: respond UNAVAILABLE immediately!
+      uint8_t unavailPayload[1] = { CALL_SIG_UNAVAILABLE };
+      uint8_t respFrame[MAX_PACKET_SIZE];
+      size_t respLen = buildV2Packet(
+        respFrame,
+        PKT_CALL_SIGNAL,
+        msgUuid,
+        targetId,
+        senderId,
+        0x00,
+        unavailPayload,
+        1
+      );
+      if (respLen > 0) {
+        sendToConnId(rf.connId, respFrame, respLen);
+      }
+    }
+    return;
+  }
+
+  // Visual strobe for standard messages & control packets
+  strobeLed(1, 20);
+
+  // Presence Hello & Unique Username Registration
+  if (pktType == PKT_PRESENCE_HELLO) {
+    char displayName[33];
+    memset(displayName, 0, sizeof(displayName));
+    size_t dCopy = min((size_t)32, (size_t)pLen);
+    if (dCopy > 0) memcpy(displayName, payload, dCopy);
+    if (displayName[0] == '\0') strncpy(displayName, senderId, 32);
+
+    int existingPeer = findPeerByUsername(senderId);
+    bool conflict = false;
+
+    if (existingPeer >= 0) {
+      // Same username already registered: verify deviceUuid (stored in msgUuid)
+      if (memcmp(peers[existingPeer].deviceUuid, msgUuid, 16) != 0) {
+        conflict = true;
+      } else {
+        strncpy(peers[existingPeer].displayName, displayName, 32);
+        peers[existingPeer].displayName[32] = '\0';
+        savePeersToFS();
+      }
+    } else {
+      // Register new unique user
+      int slot = -1;
+      for (int i = 0; i < MAX_PEERS; i++) {
+        if (!peers[i].active) { slot = i; break; }
+      }
+      if (slot >= 0) {
+        peers[slot].active = true;
+        memcpy(peers[slot].deviceUuid, msgUuid, 16);
+        strncpy(peers[slot].username, senderId, MAX_ID_LEN);
+        peers[slot].username[MAX_ID_LEN] = '\0';
+        strncpy(peers[slot].displayName, displayName, 32);
+        peers[slot].displayName[32] = '\0';
+        savePeersToFS();
+        Serial.printf("[PRESENCE] Registered new unique user: '%s' (%s)\n", senderId, displayName);
+      }
+    }
+
+    uint8_t ackStatus[1] = { (uint8_t)(conflict ? 0x02 : 0x01) }; // 0x01=OK, 0x02=NAME_CONFLICT
+    uint8_t ackFrame[MAX_PACKET_SIZE];
+    size_t ackLen = buildV2Packet(
+      ackFrame,
+      PKT_PRESENCE_HELLO,
+      msgUuid,
+      "RELAY",
+      senderId,
+      0x00,
+      ackStatus,
+      1
+    );
+    if (ackLen > 0) {
+      sendToConnId(rf.connId, ackFrame, ackLen);
+    }
+
+    if (conflict) {
+      Serial.printf("[PRESENCE] Name conflict rejected for '%s' on conn %d\n", senderId, rf.connId);
       return;
     }
 
-    Serial.println("\n+-------------------------------------------------------------+");
-    Serial.println("|  [ESP32 DEVKIT V1] INCOMING MESSAGE MAIL FROM PHONE         |");
-    Serial.println("+-------------------------------------------------------------+");
-    Serial.printf("  Message UUID : %s\n", uuidStr);
-    Serial.printf("  Payload Type : 0x%02X [%s]\n", payloadType, 
-      payloadType == 0x01 ? "UTF-8 TEXT" : 
-      payloadType == 0x02 ? "COMPRESSED VOICE MAIL (Codec2)" : 
-      payloadType == 0x03 ? "DELIVERY ACK" : "SYNC POLL");
-    Serial.printf("  Recipient ID : %s\n", recipientId);
-    Serial.printf("  Payload Size : %d bytes (Total frame: %d bytes)\n", payloadLen, len);
-
-    if (payloadType == 0x01 && payloadLen > 0) {
-      char textBuf[512];
-      size_t copyLen = payloadLen < sizeof(textBuf) - 1 ? payloadLen : sizeof(textBuf) - 1;
-      memcpy(textBuf, &bytes[27], copyLen);
-      textBuf[copyLen] = '\0';
-      Serial.printf("  Text Content : \"%s\"\n", textBuf);
-    } else if (payloadType == 0x02) {
-      Serial.printf("  Audio Blob   : %d bytes of 8 kHz Codec2 voice frame stream\n", payloadLen);
+    int sessIdx = findSessionByConnId(rf.connId);
+    if (sessIdx < 0) {
+      for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!sessions[i].active) {
+          sessions[i].active = true;
+          sessions[i].connId = rf.connId;
+          sessions[i].registered = false;
+          memset(sessions[i].username, 0, sizeof(sessions[i].username));
+          sessIdx = i;
+          break;
+        }
+      }
+    }
+    if (sessIdx >= 0) {
+      // Evict stale duplicate-username registration from any other connection
+      for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (i != sessIdx && sessions[i].active && sessions[i].registered &&
+            strcmp(sessions[i].username, senderId) == 0) {
+          Serial.printf("[PRESENCE] Evicting stale '%s' on connId=%d\n",
+            senderId, sessions[i].connId);
+          sessions[i].registered = false;
+          memset(sessions[i].username, 0, sizeof(sessions[i].username));
+        }
+      }
+      strncpy(sessions[sessIdx].username, senderId, MAX_ID_LEN);
+      sessions[sessIdx].username[MAX_ID_LEN] = '\0';
+      sessions[sessIdx].registered = true;
     }
 
-    // A. REAL-TIME RELAY: Immediately notify any connected phone(s) in real time
-    if (pRxCharacteristic != nullptr) {
-      pRxCharacteristic->setValue((uint8_t*)bytes, len);
-      pRxCharacteristic->notify();
-      Serial.println("  Forwarding   : NOTIFIED IN REAL-TIME TO CONNECTED PHONES");
-    }
+    Serial.printf("[PRESENCE] '%s' online on connId=%d\n", senderId, rf.connId);
+    pendingDirectoryBroadcast = true;
+    return;
+  }
 
-    // B. STORE-AND-FORWARD: Buffer in local ESP32 RAM mailbox for offline users
-    if (payloadType != 0x03 && mailboxCount < MAX_QUEUE_ITEMS) {
-      MailboxMessage& item = mailbox[mailboxCount];
-      memcpy(item.uuid, bytes, 16);
-      item.payloadType = payloadType;
-      strncpy(item.recipient, recipientId, 8);
-      item.recipient[8] = '\0';
-      item.length = payloadLen < MAX_PAYLOAD_SIZE ? payloadLen : MAX_PAYLOAD_SIZE;
-      memcpy(item.payload, &bytes[27], item.length);
-      item.isBuffered = true;
-      mailboxCount++;
-      Serial.printf("  Queue Status : BUFFERED IN ESP32 RAM (Total in queue: %d)\n", mailboxCount);
+  // Sync Poll: Push directory + any offline messages addressed to senderId
+  if (pktType == PKT_SYNC_POLL) {
+    Serial.printf("[SYNC] Poll from '%s' (connId=%d)\n", senderId, rf.connId);
+    sendPeerDirectoryToConn(rf.connId);
+    deliverOfflineMailboxForUser(rf.connId, senderId);
+    return;
+  }
+
+  // Group Meta Creation / Sync
+  if (pktType == PKT_GROUP_META) {
+    if (pLen < 2) return;
+    uint8_t nameLen = payload[0];
+    if (1 + nameLen >= pLen) return;
+    uint8_t memberCount = payload[1 + nameLen];
+    size_t pos = 2 + nameLen;
+
+    int gIdx = findGroupById(targetId);
+    if (gIdx < 0) {
+      for (int i = 0; i < MAX_GROUPS; i++) {
+        if (!groups[i].active) { gIdx = i; break; }
+      }
     }
-    Serial.println("+-------------------------------------------------------------+");
+    if (gIdx >= 0) {
+      groups[gIdx].active = true;
+      strncpy(groups[gIdx].groupId, targetId, MAX_ID_LEN);
+      groups[gIdx].groupId[MAX_ID_LEN] = '\0';
+      groups[gIdx].memberCount = 0;
+
+      char forwardTargets[MAX_GROUP_MEMBERS][MAX_ID_LEN + 1];
+      int fwdCount = 0;
+
+      for (int m = 0; m < memberCount && groups[gIdx].memberCount < MAX_GROUP_MEMBERS; m++) {
+        if (pos >= pLen) break;
+        uint8_t mLen = payload[pos++];
+        if (mLen == 0 || mLen > MAX_ID_LEN || pos + mLen > pLen) break;
+
+        char mName[MAX_ID_LEN + 1];
+        memset(mName, 0, sizeof(mName));
+        memcpy(mName, &payload[pos], mLen);
+        pos += mLen;
+
+        strncpy(groups[gIdx].members[groups[gIdx].memberCount], mName, MAX_ID_LEN);
+        groups[gIdx].members[groups[gIdx].memberCount][MAX_ID_LEN] = '\0';
+        groups[gIdx].memberCount++;
+
+        if (strcmp(mName, senderId) != 0 && fwdCount < MAX_GROUP_MEMBERS) {
+          strncpy(forwardTargets[fwdCount], mName, MAX_ID_LEN);
+          forwardTargets[fwdCount][MAX_ID_LEN] = '\0';
+          fwdCount++;
+        }
+      }
+      saveGroupsToFS();
+      Serial.printf("[GROUP] Saved group '%s' (%d members). Fanning out to %d peers.\n",
+        targetId, groups[gIdx].memberCount, fwdCount);
+
+      if (fwdCount > 0) {
+        routePacketToTargets(forwardTargets, fwdCount, rf.data, rf.len, true);
+      }
+    }
+    return;
+  }
+
+  // Standard 1-to-1 or Group Message / Voice Chunk / Delivery ACK
+  if (pktType == PKT_TEXT_MSG || pktType == PKT_VOICE_CHUNK || pktType == PKT_DELIVERY_ACK) {
+    bool isGroup = (flags & FLAG_GROUP) != 0;
+    bool storeOffline = (pktType != PKT_DELIVERY_ACK); // Queue texts/voice & ACKs? Wait: queue ACKs too so sender gets double-check when returning!
+    storeOffline = true;
+
+    if (isGroup && pktType != PKT_DELIVERY_ACK) {
+      int gIdx = findGroupById(targetId);
+      if (gIdx >= 0) {
+        char targets[MAX_GROUP_MEMBERS][MAX_ID_LEN + 1];
+        int tCount = 0;
+        for (int m = 0; m < groups[gIdx].memberCount; m++) {
+          if (strcmp(groups[gIdx].members[m], senderId) != 0 && tCount < MAX_GROUP_MEMBERS) {
+            strncpy(targets[tCount], groups[gIdx].members[m], MAX_ID_LEN);
+            targets[tCount][MAX_ID_LEN] = '\0';
+            tCount++;
+          }
+        }
+        Serial.printf("[RELAY] Group %s (%s -> %d members, %d B)\n",
+          pktType == PKT_TEXT_MSG ? "TXT" : "VOICE", senderId, tCount, rf.len);
+        routePacketToTargets(targets, tCount, rf.data, rf.len, true);
+      } else {
+        Serial.printf("[RELAY] Unknown group '%s' from '%s'\n", targetId, senderId);
+      }
+    } else {
+      char singleTarget[1][MAX_ID_LEN + 1];
+      memset(singleTarget[0], 0, MAX_ID_LEN + 1);
+      strncpy(singleTarget[0], targetId, MAX_ID_LEN);
+      Serial.printf("[RELAY] Unicast 0x%02X: %s -> %s (%d B)\n", pktType, senderId, targetId, rf.len);
+      routePacketToTargets(singleTarget, 1, rf.data, rf.len, storeOffline);
+    }
+  }
+}
+
+// ============================================================================
+// BLE Callbacks
+// ============================================================================
+
+class DevKitServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pSrv, esp_ble_gatts_cb_param_t* param) override {
+    uint16_t connId = param ? param->connect.conn_id : pSrv->getConnId();
+    int existing = findSessionByConnId(connId);
+    if (existing >= 0) {
+      sessions[existing].registered = false;
+      memset(sessions[existing].username, 0, sizeof(sessions[existing].username));
+    } else {
+      for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!sessions[i].active) {
+          sessions[i].active = true;
+          sessions[i].connId = connId;
+          sessions[i].registered = false;
+          memset(sessions[i].username, 0, sizeof(sessions[i].username));
+          break;
+        }
+      }
+    }
+    digitalWrite(STATUS_LED, HIGH);
+    Serial.printf("\n[BLE] >>> Client connected (connId=%d). Active: %d\n", connId, getActiveSessionCount());
+    pSrv->startAdvertising(); // Keep advertising for additional phones
+  }
+
+  void onDisconnect(BLEServer* pSrv, esp_ble_gatts_cb_param_t* param) override {
+    uint16_t connId = param ? param->disconnect.conn_id : 0;
+    bool wasRegistered = false;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+      if (sessions[i].active && sessions[i].connId == connId) {
+        wasRegistered = sessions[i].registered;
+        Serial.printf("\n[BLE] <<< Client disconnected (connId=%d, user='%s')\n",
+          connId, sessions[i].username);
+        sessions[i].active = false;
+        sessions[i].registered = false;
+        memset(sessions[i].username, 0, sizeof(sessions[i].username));
+        break;
+      }
+    }
+    if (getActiveSessionCount() == 0) {
+      digitalWrite(STATUS_LED, LOW);
+    }
+    if (wasRegistered) {
+      pendingDirectoryBroadcast = true;
+    }
+    pSrv->startAdvertising();
   }
 };
+
+class DevKitTxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar, esp_ble_gatts_cb_param_t* param) override {
+    const uint8_t* rawPtr = nullptr;
+    size_t len = 0;
+    String rxData;
+
+    if (param && param->write.len > 0 && param->write.value != nullptr) {
+      rawPtr = param->write.value;
+      len = param->write.len;
+    } else {
+      rxData = pChar->getValue();
+      len = rxData.length();
+      rawPtr = (const uint8_t*)rxData.c_str();
+    }
+    if (!rawPtr || len < MIN_HEADER_V2 || len > MAX_PACKET_SIZE) return;
+
+    uint16_t connId = param ? param->write.conn_id : 0;
+
+    portENTER_CRITICAL(&rxMux);
+    int nextHead = (rxHead + 1) % RX_RING_SIZE;
+    if (nextHead != rxTail) {
+      rxRing[rxHead].connId = connId;
+      rxRing[rxHead].len = (uint16_t)len;
+      memcpy(rxRing[rxHead].data, rawPtr, len);
+      rxHead = nextHead;
+    }
+    portEXIT_CRITICAL(&rxMux);
+  }
+};
+
+// ============================================================================
+// Setup & Main Loop
+// ============================================================================
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(400);
 
-  // Initialize Onboard Blue LED on GPIO 2
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, LOW);
+  memset(sessions, 0, sizeof(sessions));
 
   Serial.println("\n=============================================================");
-  Serial.println("  ESP32 DEVKIT V1 - OFF-GRID 'MESSAGE MAIL' RELAY NODE");
-  Serial.println("=============================================================");
-  Serial.printf("  Chip Model   : %s (Rev %d)\n", ESP.getChipModel(), ESP.getChipRevision());
-  Serial.printf("  CPU Clock    : %d MHz\n", ESP.getCpuFreqMHz());
-  Serial.printf("  Free Heap    : %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("  BLE Device   : %s\n", NODE_NAME);
-  Serial.printf("  Service UUID : %s\n", SERVICE_UUID);
+  Serial.println("  ESP32 DEVKIT V1 - OFF-GRID MESSAGE MAIL RELAY (v2)");
   Serial.println("=============================================================");
 
-  // Initialize ESP32 BLE
+  fsReady = LittleFS.begin(true);
+  if (fsReady) {
+    loadPeersFromFS();
+    loadGroupsFromFS();
+    initMailboxDir();
+    Serial.printf("  LittleFS     : Mounted (%u / %u KB used)\n",
+      (unsigned)(LittleFS.usedBytes() / 1024),
+      (unsigned)(LittleFS.totalBytes() / 1024));
+  } else {
+    Serial.println("  LittleFS     : Failed to mount! Offline flash disabled.");
+  }
+
   BLEDevice::init(NODE_NAME);
-
-  // Set MTU to 512 bytes for fast binary voice mail transfers
+  BLEDevice::setCustomGattsHandler(onCustomGattsEvent);
   BLEDevice::setMTU(512);
 
-  // Create BLE Server
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new DevKitServerCallbacks());
 
-  // Create GATT Service
   BLEService* pService = pServer->createService(SERVICE_UUID);
 
-  // Characteristic Data TX (Phone -> ESP32 Write Without Response)
   pTxCharacteristic = pService->createCharacteristic(
     CHAR_DATA_TX_UUID,
     BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
   );
   pTxCharacteristic->setCallbacks(new DevKitTxCallbacks());
 
-  // Characteristic Data RX (ESP32 -> Phone Notify)
   pRxCharacteristic = pService->createCharacteristic(
     CHAR_DATA_RX_UUID,
     BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
   );
   pRxCharacteristic->addDescriptor(new BLE2902());
 
-  // Start the Service
   pService->start();
 
-  // Configure Advertising
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06); // functions that help with iPhone connections issue
+  pAdvertising->setMinPreferred(0x06);
   pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
 
-  Serial.println("[BLE] GATT Server active!");
-  Serial.println("[BLE] Open 'Message Mail' on your mobile and tap the connection pill to pair.\n");
+  Serial.printf("  BLE Device   : %s\n", NODE_NAME);
+  Serial.printf("  Service UUID : %s\n", SERVICE_UUID);
+  Serial.println("=============================================================\n");
 }
 
 void loop() {
-  // Handle disconnection & reconnection advertising
-  if (!deviceConnected && oldDeviceConnected) {
-    delay(500);
-    pServer->startAdvertising();
-    oldDeviceConnected = deviceConnected;
-    Serial.println("[BLE] Restarted advertising...");
-  }
-  
-  if (deviceConnected && !oldDeviceConnected) {
-    oldDeviceConnected = deviceConnected;
-    // When a phone connects, wait 800ms and deliver any buffered mail
-    delay(800);
-    pushBufferedMailToPhone();
+  // Drain queued incoming frames cleanly outside BLE stack task
+  while (true) {
+    RxFrame rf;
+    bool hasItem = false;
+
+    portENTER_CRITICAL(&rxMux);
+    if (rxTail != rxHead) {
+      rf = rxRing[rxTail];
+      rxTail = (rxTail + 1) % RX_RING_SIZE;
+      hasItem = true;
+    }
+    portEXIT_CRITICAL(&rxMux);
+
+    if (!hasItem) break;
+    processIncomingFrame(rf);
   }
 
-  // LED Behavior:
-  // - If connected: solid ON
-  // - If disconnected: blinking slowly (every 600ms)
-  if (!deviceConnected) {
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastLedBlink >= 600) {
-      lastLedBlink = currentMillis;
+  if (pendingDirectoryBroadcast) {
+    pendingDirectoryBroadcast = false;
+    broadcastPeerDirectoryToAll();
+  }
+
+  // LED Status Indicator
+  if (getActiveSessionCount() == 0) {
+    unsigned long now = millis();
+    if (now - lastLedBlink >= 600) {
+      lastLedBlink = now;
       ledState = !ledState;
       digitalWrite(STATUS_LED, ledState ? HIGH : LOW);
     }
@@ -268,83 +1054,5 @@ void loop() {
     digitalWrite(STATUS_LED, HIGH);
   }
 
-  delay(20);
+  delay(2);
 }
-
-// Sends an end-to-end Delivery ACK packet back to the sender phone
-void sendDeliveryAck(const uint8_t* messageUuid, const char* recipient) {
-  if (!deviceConnected || pRxCharacteristic == nullptr) return;
-
-  uint8_t ackFrame[HEADER_LENGTH + 1];
-  // [0..15]: Message UUID
-  memcpy(ackFrame, messageUuid, 16);
-  // [16]: Payload Type = 0x03 (Delivery ACK)
-  ackFrame[16] = 0x03;
-  // [17..24]: Recipient ID
-  memset(&ackFrame[17], 0, 8);
-  memcpy(&ackFrame[17], recipient, strlen(recipient) < 8 ? strlen(recipient) : 8);
-  // [25..26]: Length = 1 byte
-  ackFrame[25] = 0x00;
-  ackFrame[26] = 0x01;
-  // [27]: Status 0x01 = DELIVERED
-  ackFrame[27] = 0x01;
-
-  pRxCharacteristic->setValue(ackFrame, sizeof(ackFrame));
-  pRxCharacteristic->notify();
-  Serial.println("[BLE] >>> Sent Delivery ACK (0x01 DELIVERED) back to mobile phone.");
-}
-
-// Pushes all buffered messages from the ESP32 RAM mailbox to the connected mobile phone
-void pushBufferedMailToPhone() {
-  if (mailboxCount == 0 || !deviceConnected || pRxCharacteristic == nullptr) return;
-
-  Serial.printf("[MAILBOX] Delivering %d buffered message(s) to connected mobile phone...\n", mailboxCount);
-
-  for (int i = 0; i < mailboxCount; i++) {
-    MailboxMessage& item = mailbox[i];
-    if (!item.isBuffered) continue;
-
-    strobeLed(2, 50);
-    uint16_t frameSize = HEADER_LENGTH + item.length;
-    uint8_t frame[frameSize];
-
-    // [0..15]: UUID
-    memcpy(frame, item.uuid, 16);
-    // [16]: Payload Type (0x01 text, 0x02 voice)
-    frame[16] = item.payloadType;
-    // [17..24]: Recipient / Source
-    memset(&frame[17], 0, 8);
-    memcpy(&frame[17], item.recipient, strlen(item.recipient) < 8 ? strlen(item.recipient) : 8);
-    // [25..26]: Length (Big Endian)
-    frame[25] = (item.length >> 8) & 0xFF;
-    frame[26] = item.length & 0xFF;
-    // [27..N]: Payload
-    memcpy(&frame[27], item.payload, item.length);
-
-    pRxCharacteristic->setValue(frame, frameSize);
-    pRxCharacteristic->notify();
-
-    Serial.printf("  -> Delivered buffered message %d/%d (%d bytes) to mobile phone\n", 
-      i + 1, mailboxCount, frameSize);
-    item.isBuffered = false;
-    delay(120); // Small interval between packet deliveries
-  }
-
-  // Clear delivered mailbox
-  mailboxCount = 0;
-  Serial.println("[MAILBOX] All buffered messages successfully delivered to mobile!\n");
-}
-
-// Flashes the onboard blue LED
-void strobeLed(int times, int delayMs) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(STATUS_LED, HIGH);
-    delay(delayMs);
-    digitalWrite(STATUS_LED, LOW);
-    delay(delayMs);
-  }
-  if (deviceConnected) {
-    digitalWrite(STATUS_LED, HIGH);
-  }
-}
-

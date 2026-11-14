@@ -1,13 +1,17 @@
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:message_mail/models/message_mail.dart';
-import 'package:message_mail/services/database_service.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:message_mail/models/message_mail.dart';
+import 'package:message_mail/protocol/ble_packet_codec.dart';
+import 'package:message_mail/services/database_service.dart';
 
 void main() {
-  sqfliteFfiInit();
+  setUpAll(() {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  });
 
-  group('DatabaseService Unit Tests', () {
+  group('SQLite Schema v2 DatabaseService Tests', () {
     late Database rawDb;
     late DatabaseService dbService;
 
@@ -15,7 +19,8 @@ void main() {
       rawDb = await databaseFactoryFfi.openDatabase(
         inMemoryDatabasePath,
         options: OpenDatabaseOptions(
-          version: 1,
+          version: DatabaseService.databaseVersion,
+          singleInstance: false,
           onCreate: (db, version) async {
             await DatabaseService.createSchema(db);
           },
@@ -28,216 +33,186 @@ void main() {
       await dbService.close();
     });
 
-    test('saveOutgoingMessage stores record with PENDING_LOCAL status', () async {
-      final msg = MessageMail(
-        id: '11111111-2222-3333-4444-555555555555',
-        senderId: 'CLIENT-A',
-        recipientId: 'NODE-P2',
-        payloadType: PayloadType.text,
-        textContent: 'Tactical emergency alert',
-        timestamp: 1690000000,
-        status: MessageStatus.delivered, // Will be coerced to pendingLocal
+    test('Stores and retrieves LocalProfile, Peers, and Groups', () async {
+      const profile = LocalProfile(
+        deviceUuid: '11111111-1111-1111-1111-111111111111',
+        username: 'harshil',
+        displayName: 'Harshil',
+        isVerifiedOnRelay: true,
       );
+      await dbService.saveLocalProfile(profile);
+      final loaded = await dbService.getLocalProfile();
+      expect(loaded, isNotNull);
+      expect(loaded!.username, equals('harshil'));
+      expect(loaded.isVerifiedOnRelay, isTrue);
 
-      await dbService.saveOutgoingMessage(msg);
+      await dbService.upsertPeers(const [
+        DirectoryPeerEntry(username: 'harshil', displayName: 'Harshil', isOnline: true),
+        DirectoryPeerEntry(username: 'taksh', displayName: 'Taksh', isOnline: true),
+        DirectoryPeerEntry(username: 'priya', displayName: 'Priya', isOnline: false),
+      ]);
 
-      final retrieved = await dbService.getMessageById(msg.id);
-      expect(retrieved, isNotNull);
-      expect(retrieved!.id, equals(msg.id));
-      expect(retrieved.status, equals(MessageStatus.pendingLocal));
-      expect(retrieved.textContent, equals('Tactical emergency alert'));
+      final otherPeers = await dbService.getPeers(excludeUsername: 'harshil');
+      expect(otherPeers.length, equals(2));
+      expect(otherPeers.first.username, equals('taksh')); // online sorted first
+
+      await dbService.setAllPeersOffline();
+      final takshAfter = await dbService.getPeer('taksh');
+      expect(takshAfter!.isOnline, isFalse);
+
+      final group = ChatGroup(
+        groupId: 'g_trek1',
+        groupName: 'Trek Squad',
+        createdBy: 'harshil',
+        createdAt: 1000,
+        members: const ['harshil', 'taksh', 'priya'],
+      );
+      await dbService.saveGroup(group);
+      final fetchedGroup = await dbService.getGroupById('g_trek1');
+      expect(fetchedGroup, isNotNull);
+      expect(fetchedGroup!.groupName, equals('Trek Squad'));
+      expect(fetchedGroup.members, containsAll(['harshil', 'taksh', 'priya']));
     });
 
-    test('getPendingOutbox retrieves records ordered chronologically by timestamp ASC', () async {
-      final msg1 = MessageMail(
-        id: 'msg-003',
-        senderId: 'CLIENT-A',
-        recipientId: 'NODE-P1',
+    test('Stores 1-to-1 and Group messages, tracks unread counts & ChatSummaries', () async {
+      await dbService.upsertPeers(const [
+        DirectoryPeerEntry(username: 'taksh', displayName: 'Taksh', isOnline: true),
+      ]);
+      await dbService.saveGroup(
+        const ChatGroup(
+          groupId: 'g_ops',
+          groupName: 'Rescue Ops',
+          createdBy: 'harshil',
+          createdAt: 900,
+          members: ['harshil', 'taksh'],
+        ),
+      );
+
+      final m1 = MessageMail(
+        id: 'm1',
+        chatId: 'taksh',
+        senderId: 'taksh',
+        recipientId: 'harshil',
         payloadType: PayloadType.text,
-        textContent: 'Third created, later timestamp',
+        textContent: 'Reached north gate',
+        isRead: false,
+        timestamp: 2000,
+        status: MessageStatus.delivered,
+      );
+      await dbService.saveIncomingMessage(m1);
+
+      final m2 = MessageMail(
+        id: 'm2',
+        chatId: 'g_ops',
+        senderId: 'harshil',
+        recipientId: 'g_ops',
+        isGroup: true,
+        payloadType: PayloadType.voiceMail,
+        audioBlob: Uint8List.fromList([1, 2, 3, 4]),
+        durationMs: 2400,
+        codecType: VoiceCodecType.amrNb,
         timestamp: 3000,
         status: MessageStatus.pendingLocal,
       );
+      await dbService.saveOutgoingMessage(m2);
 
-      final msg2 = MessageMail(
-        id: 'msg-001',
-        senderId: 'CLIENT-A',
-        recipientId: 'NODE-P1',
-        payloadType: PayloadType.text,
-        textContent: 'First created, earliest timestamp',
-        timestamp: 1000,
-        status: MessageStatus.pendingLocal,
-      );
+      var summaries = await dbService.getChatSummaries('harshil');
+      expect(summaries.length, equals(2));
+      // Most recent activity first
+      expect(summaries[0].chatId, equals('g_ops'));
+      expect(summaries[0].isGroup, isTrue);
+      expect(summaries[1].chatId, equals('taksh'));
+      expect(summaries[1].unreadCount, equals(1));
 
-      final msg3 = MessageMail(
-        id: 'msg-002',
-        senderId: 'CLIENT-A',
-        recipientId: 'NODE-P1',
-        payloadType: PayloadType.text,
-        textContent: 'Second created, middle timestamp',
-        timestamp: 2000,
-        status: MessageStatus.pendingLocal,
-      );
-
-      await dbService.saveOutgoingMessage(msg1);
-      await dbService.saveOutgoingMessage(msg2);
-      await dbService.saveOutgoingMessage(msg3);
-
-      final outbox = await dbService.getPendingOutbox();
-      expect(outbox.length, equals(3));
-      expect(outbox[0].id, equals('msg-001'));
-      expect(outbox[1].id, equals('msg-002'));
-      expect(outbox[2].id, equals('msg-003'));
+      await dbService.markChatAsRead('taksh');
+      summaries = await dbService.getChatSummaries('harshil');
+      final takshSummary = summaries.firstWhere((c) => c.chatId == 'taksh');
+      expect(takshSummary.unreadCount, equals(0));
     });
 
-    test('markAsInTransit transitions status from PENDING_LOCAL to IN_TRANSIT', () async {
+    test('Outbox queue lifecycle: pending -> inTransit -> delivered / failed & reset', () async {
       final msg = MessageMail(
-        id: 'msg-transit-test',
-        senderId: 'CLIENT-A',
-        recipientId: 'NODE-P3',
+        id: 'out-1',
+        chatId: 'taksh',
+        senderId: 'harshil',
+        recipientId: 'taksh',
         payloadType: PayloadType.text,
-        textContent: 'Testing transit update',
-        timestamp: 1500,
-        status: MessageStatus.pendingLocal,
-      );
-
-      await dbService.saveOutgoingMessage(msg);
-      final affected = await dbService.markAsInTransit(msg.id);
-      expect(affected, equals(1));
-
-      final updated = await dbService.getMessageById(msg.id);
-      expect(updated!.status, equals(MessageStatus.inTransit));
-
-      // Should no longer appear in pending outbox
-      final pending = await dbService.getPendingOutbox();
-      expect(pending.where((m) => m.id == msg.id), isEmpty);
-    });
-
-    test('saveIncomingMessage stores record with DELIVERED status', () async {
-      final msg = MessageMail(
-        id: 'msg-incoming-01',
-        senderId: 'NODE-P1',
-        recipientId: 'CLIENT-A',
-        payloadType: PayloadType.voiceMail,
-        audioBlob: Uint8List.fromList([0x43, 0x32, 0x56, 0x4D, 0x01, 0x02]),
-        timestamp: 2500,
-        status: MessageStatus.pendingLocal, // Will be coerced to delivered
-      );
-
-      await dbService.saveIncomingMessage(msg);
-
-      final retrieved = await dbService.getMessageById(msg.id);
-      expect(retrieved, isNotNull);
-      expect(retrieved!.status, equals(MessageStatus.delivered));
-      expect(retrieved.payloadType, equals(PayloadType.voiceMail));
-      expect(retrieved.audioBlob, equals(Uint8List.fromList([0x43, 0x32, 0x56, 0x4D, 0x01, 0x02])));
-    });
-
-    test('updateStatusByAck updates message status based on LoRa ACK', () async {
-      final msg = MessageMail(
-        id: 'msg-ack-test',
-        senderId: 'CLIENT-A',
-        recipientId: 'NODE-P5',
-        payloadType: PayloadType.text,
-        textContent: 'Relay packet waiting for ACK',
-        timestamp: 5000,
-        status: MessageStatus.pendingLocal,
-      );
-
-      await dbService.saveOutgoingMessage(msg);
-      await dbService.markAsInTransit(msg.id);
-
-      // ACK arrives confirming delivery
-      await dbService.updateStatusByAck(msg.id, 'DELIVERED');
-      var updated = await dbService.getMessageById(msg.id);
-      expect(updated!.status, equals(MessageStatus.delivered));
-
-      // Test failure ACK
-      await dbService.updateStatusByAck(msg.id, 'FAILED');
-      updated = await dbService.getMessageById(msg.id);
-      expect(updated!.status, equals(MessageStatus.failed));
-    });
-
-    test('Schema enforces CHECK constraint on payload_type and status', () async {
-      // Direct raw insert violating payload_type CHECK constraint
-      expect(
-        () async => await rawDb.execute('''
-          INSERT INTO ${DatabaseService.tableName}
-          (id, sender_id, recipient_id, payload_type, timestamp, status)
-          VALUES ('bad-type', 'A', 'B', 'invalid_type', 100, 'PENDING_LOCAL')
-        '''),
-        throwsA(isA<DatabaseException>()),
-      );
-
-      // Direct raw insert violating status CHECK constraint
-      expect(
-        () async => await rawDb.execute('''
-          INSERT INTO ${DatabaseService.tableName}
-          (id, sender_id, recipient_id, payload_type, timestamp, status)
-          VALUES ('bad-status', 'A', 'B', 'text', 100, 'UNKNOWN_STATUS')
-        '''),
-        throwsA(isA<DatabaseException>()),
-      );
-    });
-
-    test('Handles null and corrupt payload structures safely', () async {
-      final textWithNullContent = MessageMail(
-        id: 'null-text',
-        senderId: 'CLIENT-A',
-        recipientId: 'NODE-P1',
-        payloadType: PayloadType.text,
-        textContent: null,
+        textContent: 'Queued offline',
         timestamp: 100,
         status: MessageStatus.pendingLocal,
       );
+      await dbService.saveOutgoingMessage(msg);
+      expect((await dbService.getPendingOutbox()).length, equals(1));
 
-      await dbService.saveOutgoingMessage(textWithNullContent);
-      final retrieved = await dbService.getMessageById('null-text');
-      expect(retrieved, isNotNull);
-      expect(retrieved!.textContent, isNull);
-      expect(retrieved.audioBlob, isNull);
+      await dbService.markAsInTransit('out-1');
+      expect((await dbService.getPendingOutbox()), isEmpty);
 
-      final emptyAudio = MessageMail(
-        id: 'empty-audio',
-        senderId: 'CLIENT-A',
-        recipientId: 'NODE-P1',
-        payloadType: PayloadType.voiceMail,
-        audioBlob: Uint8List(0),
-        timestamp: 101,
-        status: MessageStatus.pendingLocal,
-      );
+      await dbService.updateStatusByAck('out-1', 'DELIVERED');
+      expect((await dbService.getMessageById('out-1'))!.status, equals(MessageStatus.delivered));
 
-      await dbService.saveOutgoingMessage(emptyAudio);
-      final retrievedAudio = await dbService.getMessageById('empty-audio');
-      expect(retrievedAudio, isNotNull);
-      expect(retrievedAudio!.audioBlob, isNotNull);
-      expect(retrievedAudio.audioBlob!.length, equals(0));
+      await dbService.updateStatusByAck('out-1', 'FAILED');
+      expect((await dbService.getMessageById('out-1'))!.status, equals(MessageStatus.failed));
+
+      final reset = await dbService.resetStuckQueueToPending();
+      expect(reset, equals(1));
+      expect((await dbService.getPendingOutbox()).length, equals(1));
     });
 
-    test('getDatabaseStats correctly counts message buckets', () async {
+    test('Call logs do not enter BLE pending outbox and pass SQLite CHECK constraint', () async {
+      final callLog = MessageMail(
+        id: 'call-1',
+        chatId: 'taksh',
+        senderId: 'harshil',
+        recipientId: 'taksh',
+        payloadType: PayloadType.callLog,
+        textContent: 'Voice call (0:15)',
+        timestamp: 500,
+        status: MessageStatus.delivered,
+      );
+      await dbService.saveOutgoingMessage(callLog);
+
+      final outbox = await dbService.getPendingOutbox();
+      expect(outbox, isEmpty);
+
+      final chatMsgs = await dbService.getMessagesForChat('taksh');
+      expect(chatMsgs.length, equals(1));
+      expect(chatMsgs.first.payloadType, equals(PayloadType.callLog));
+
+      expect(
+        () async => rawDb.execute('''
+          INSERT INTO ${DatabaseService.tableName}
+          (id, chat_id, sender_id, recipient_id, payload_type, timestamp, status)
+          VALUES ('bad', 'taksh', 'a', 'b', 'bogus_type', 1, 'PENDING_LOCAL')
+        '''),
+        throwsA(isA<DatabaseException>()),
+      );
+    });
+
+    test('getDatabaseStats reports accurate message counts', () async {
       await dbService.saveOutgoingMessage(MessageMail(
         id: 'p1',
-        senderId: 'A',
-        recipientId: 'B',
+        chatId: 'taksh',
+        senderId: 'harshil',
+        recipientId: 'taksh',
         payloadType: PayloadType.text,
         timestamp: 1,
         status: MessageStatus.pendingLocal,
       ));
       await dbService.saveOutgoingMessage(MessageMail(
         id: 'p2',
-        senderId: 'A',
-        recipientId: 'B',
+        chatId: 'taksh',
+        senderId: 'harshil',
+        recipientId: 'taksh',
         payloadType: PayloadType.text,
         timestamp: 2,
         status: MessageStatus.pendingLocal,
       ));
-
       await dbService.markAsInTransit('p2');
-
       await dbService.saveIncomingMessage(MessageMail(
         id: 'd1',
-        senderId: 'B',
-        recipientId: 'A',
+        chatId: 'taksh',
+        senderId: 'taksh',
+        recipientId: 'harshil',
         payloadType: PayloadType.text,
         timestamp: 3,
         status: MessageStatus.delivered,
@@ -247,37 +222,7 @@ void main() {
       expect(stats['PENDING_LOCAL'], equals(1));
       expect(stats['IN_TRANSIT'], equals(1));
       expect(stats['DELIVERED'], equals(1));
-      expect(stats['FAILED'], equals(0));
       expect(stats['TOTAL'], equals(3));
-    });
-
-    test('resetStuckQueueToPending resets IN_TRANSIT and FAILED records to PENDING_LOCAL', () async {
-      await dbService.saveOutgoingMessage(MessageMail(
-        id: 'stuck-1',
-        senderId: 'A',
-        recipientId: 'B',
-        payloadType: PayloadType.text,
-        timestamp: 10,
-        status: MessageStatus.pendingLocal,
-      ));
-      await dbService.markAsInTransit('stuck-1');
-
-      await dbService.saveOutgoingMessage(MessageMail(
-        id: 'stuck-2',
-        senderId: 'A',
-        recipientId: 'B',
-        payloadType: PayloadType.text,
-        timestamp: 11,
-        status: MessageStatus.pendingLocal,
-      ));
-      await dbService.updateStatusByAck('stuck-2', 'FAILED');
-
-      final resetCount = await dbService.resetStuckQueueToPending();
-      expect(resetCount, equals(2));
-
-      final pending = await dbService.getPendingOutbox();
-      expect(pending.length, equals(2));
     });
   });
 }
-

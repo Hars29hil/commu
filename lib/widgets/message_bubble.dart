@@ -4,10 +4,8 @@ import '../models/message_mail.dart';
 import '../providers/message_mail_provider.dart';
 import '../services/audio_service.dart';
 
-/// Renders a message mail item in the conversation stream:
-/// Handles both Text messages and Voice Mail compressed audio playback.
-/// Displays tactical message status badges:
-/// ⏳ Local Queue | 📡 Relaying on Mesh | ✅ Delivered | ❌ Failed
+/// WhatsApp-style message bubble supporting Text, Real Voice Notes (with duration/progress),
+/// Group sender attribution, Call logs, and delivery checkmarks.
 class MessageBubble extends StatelessWidget {
   final MessageMail message;
   final bool isOutgoing;
@@ -21,40 +19,42 @@ class MessageBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<MessageMailProvider>();
+
+    if (message.payloadType == PayloadType.callLog) {
+      return _buildCallLogPill();
+    }
+
     final isVoice = message.payloadType == PayloadType.voiceMail;
     final isPlaying = provider.audio.isPlaying &&
         provider.audio.currentlyPlayingId == message.id;
 
     final bubbleBg = isOutgoing
-        ? const Color(0xFF1E3A5F) // Tactical Navy
-        : const Color(0xFF232936); // Dark Slate
-
-    final bubbleBorder = isOutgoing
-        ? const Color(0xFF3B82F6).withValues(alpha: 0.4)
-        : Colors.white12;
+        ? const Color(0xFF005C4B) // WhatsApp dark outgoing teal
+        : const Color(0xFF1F2C34); // WhatsApp dark incoming slate
 
     return Align(
       alignment: isOutgoing ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
-        margin: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.80,
+        margin: EdgeInsets.only(
+          left: isOutgoing ? 56 : 12,
+          right: isOutgoing ? 12 : 56,
+          top: 4,
+          bottom: 4,
         ),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: BoxDecoration(
           color: bubbleBg,
           borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(16),
-            topRight: const Radius.circular(16),
-            bottomLeft: Radius.circular(isOutgoing ? 16 : 4),
-            bottomRight: Radius.circular(isOutgoing ? 4 : 16),
+            topLeft: const Radius.circular(14),
+            topRight: const Radius.circular(14),
+            bottomLeft: Radius.circular(isOutgoing ? 14 : 3),
+            bottomRight: Radius.circular(isOutgoing ? 3 : 14),
           ),
-          border: Border.all(color: bubbleBorder),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withValues(alpha: 0.25),
-              blurRadius: 4,
-              offset: const Offset(0, 2),
+              color: Colors.black.withValues(alpha: 0.2),
+              blurRadius: 3,
+              offset: const Offset(0, 1),
             ),
           ],
         ),
@@ -62,53 +62,43 @@ class MessageBubble extends StatelessWidget {
           crossAxisAlignment:
               isOutgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
-            // Sender / Node Header
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  isOutgoing ? Icons.arrow_upward : Icons.arrow_downward,
-                  size: 11,
-                  color: isOutgoing ? const Color(0xFF60A5FA) : const Color(0xFF4ADE80),
+            if (!isOutgoing && message.isGroup) ...[
+              Text(
+                provider.resolveDisplayName(message.senderId),
+                style: TextStyle(
+                  color: _colorForSender(message.senderId),
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
                 ),
-                const SizedBox(width: 4),
-                Text(
-                  isOutgoing
-                      ? 'TO: ${message.recipientId}'
-                      : 'FROM: ${message.senderId}',
-                  style: const TextStyle(
-                    color: Colors.white54,
-                    fontSize: 10.5,
-                    fontWeight: FontWeight.bold,
-                    fontFamily: 'monospace',
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 6),
-
-            // Content: Voice Mail or Text
+              ),
+              const SizedBox(height: 3),
+            ],
             if (isVoice)
               _buildVoiceMailPlayer(context, provider, isPlaying)
             else
-              _buildTextContent(),
-
-            const SizedBox(height: 8),
-
-            // Timestamp and Status Badge Footer
+              Text(
+                message.textContent ?? '',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 15,
+                  height: 1.32,
+                ),
+              ),
+            const SizedBox(height: 4),
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
                   _formatTime(message.timestamp),
-                  style: const TextStyle(
-                    color: Colors.white38,
-                    fontSize: 10,
-                    fontFamily: 'monospace',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.6),
+                    fontSize: 10.5,
                   ),
                 ),
-                const SizedBox(width: 8),
-                _buildStatusBadge(message.status),
+                if (isOutgoing) ...[
+                  const SizedBox(width: 5),
+                  _buildStatusTick(message.status),
+                ],
               ],
             ),
           ],
@@ -117,13 +107,43 @@ class MessageBubble extends StatelessWidget {
     );
   }
 
-  Widget _buildTextContent() {
-    return Text(
-      message.textContent ?? '',
-      style: const TextStyle(
-        color: Colors.white,
-        fontSize: 14.5,
-        height: 1.35,
+  Widget _buildCallLogPill() {
+    final text = message.textContent ?? 'Voice call';
+    final isMissed = text.toLowerCase().contains('unanswered') ||
+        text.toLowerCase().contains('missed') ||
+        text.toLowerCase().contains('declined');
+
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 20),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFF182229),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: isMissed
+                ? const Color(0xFFEF4444).withValues(alpha: 0.4)
+                : Colors.white12,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              isMissed ? Icons.call_missed : Icons.call,
+              size: 14,
+              color: isMissed ? const Color(0xFFF87171) : const Color(0xFF00E676),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              '$text • ${_formatTime(message.timestamp)}',
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -134,26 +154,30 @@ class MessageBubble extends StatelessWidget {
     bool isPlaying,
   ) {
     final blob = message.audioBlob;
-    final byteSize = blob?.length ?? 0;
-    final waveform = AudioService.extractWaveform(blob, barCount: 22);
+    final waveform = AudioService.extractWaveform(blob, barCount: 24);
+    final totalMs = message.durationMs > 0
+        ? message.durationMs
+        : (isPlaying && provider.audio.currentDuration.inMilliseconds > 0
+            ? provider.audio.currentDuration.inMilliseconds
+            : 2000);
+    final posMs = isPlaying ? provider.audio.currentPosition.inMilliseconds : 0;
+    final progress = totalMs > 0 ? (posMs / totalMs).clamp(0.0, 1.0) : 0.0;
 
-    return Container(
-      padding: const EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: Colors.black26,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white10),
-      ),
+    return SizedBox(
+      width: 230,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              // Play/Pause circular button
               GestureDetector(
                 onTap: () {
                   if (blob != null && blob.isNotEmpty) {
-                    provider.audio.playAudioBlob(message.id, blob);
+                    provider.audio.playVoiceNote(
+                      messageId: message.id,
+                      blob: blob,
+                      codecType: message.codecType,
+                    );
                   }
                 },
                 child: Container(
@@ -162,18 +186,8 @@ class MessageBubble extends StatelessWidget {
                   decoration: BoxDecoration(
                     color: isPlaying
                         ? const Color(0xFFEF4444)
-                        : const Color(0xFF3B82F6),
+                        : const Color(0xFF25D366),
                     shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color: (isPlaying
-                                ? const Color(0xFFEF4444)
-                                : const Color(0xFF3B82F6))
-                            .withValues(alpha: 0.4),
-                        blurRadius: 6,
-                        spreadRadius: 1,
-                      ),
-                    ],
                   ),
                   child: Icon(
                     isPlaying ? Icons.pause : Icons.play_arrow,
@@ -183,56 +197,54 @@ class MessageBubble extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 10),
-              // Waveform bars
               Expanded(
-                child: SizedBox(
-                  height: 32,
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: waveform.map((amp) {
-                      return Container(
-                        width: 3,
-                        height: (amp * 28).clamp(4.0, 28.0),
-                        decoration: BoxDecoration(
-                          color: isPlaying
-                              ? const Color(0xFF60A5FA)
-                              : Colors.white54,
-                          borderRadius: BorderRadius.circular(2),
-                        ),
-                      );
-                    }).toList(),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          // Codec2 payload info
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.mic, size: 11, color: Color(0xFF60A5FA)),
-                  const SizedBox(width: 4),
-                  Text(
-                    'Codec2 Voice Mail • $byteSize B',
-                    style: const TextStyle(
-                      color: Color(0xFF93C5FD),
-                      fontSize: 10,
-                      fontWeight: FontWeight.w600,
-                      fontFamily: 'monospace',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      height: 28,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: List.generate(waveform.length, (i) {
+                          final barProgress = (i + 1) / waveform.length;
+                          final active = isPlaying && barProgress <= progress;
+                          return Container(
+                            width: 3,
+                            height: (waveform[i] * 26).clamp(4.0, 26.0),
+                            decoration: BoxDecoration(
+                              color: active
+                                  ? const Color(0xFF25D366)
+                                  : Colors.white54,
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          );
+                        }),
+                      ),
                     ),
-                  ),
-                ],
-              ),
-              const Text(
-                '8 kHz Mono',
-                style: TextStyle(
-                  color: Colors.white38,
-                  fontSize: 10,
-                  fontFamily: 'monospace',
+                    const SizedBox(height: 3),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          isPlaying
+                              ? _formatDuration(posMs)
+                              : _formatDuration(totalMs),
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.75),
+                            fontSize: 10.5,
+                          ),
+                        ),
+                        Text(
+                          '${((blob?.length ?? 0) / 1024).toStringAsFixed(1)} KB',
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.5),
+                            fontSize: 10,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -242,46 +254,40 @@ class MessageBubble extends StatelessWidget {
     );
   }
 
-  Widget _buildStatusBadge(MessageStatus status) {
-    String label;
-    Color color;
-
+  Widget _buildStatusTick(MessageStatus status) {
     switch (status) {
       case MessageStatus.pendingLocal:
-        label = '⏳ Local Queue';
-        color = const Color(0xFFFFB300); // Amber
-        break;
+        return Icon(Icons.access_time,
+            size: 13, color: Colors.white.withValues(alpha: 0.65));
       case MessageStatus.inTransit:
-        label = '📡 Relaying on Mesh';
-        color = const Color(0xFF38BDF8); // Cyan
-        break;
+        return Icon(Icons.done,
+            size: 14, color: Colors.white.withValues(alpha: 0.75));
       case MessageStatus.delivered:
-        label = '✅ Delivered';
-        color = const Color(0xFF4ADE80); // Green
-        break;
+        return const Icon(Icons.done_all, size: 15, color: Color(0xFF53BDEB));
       case MessageStatus.failed:
-        label = '❌ Failed';
-        color = const Color(0xFFF87171); // Red
-        break;
+        return const Icon(Icons.error_outline,
+            size: 14, color: Color(0xFFF87171));
     }
+  }
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.15),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: color.withValues(alpha: 0.4), width: 0.8),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          color: color,
-          fontSize: 9.5,
-          fontWeight: FontWeight.w700,
-          fontFamily: 'monospace',
-        ),
-      ),
-    );
+  Color _colorForSender(String name) {
+    const palette = [
+      Color(0xFF53BDEB),
+      Color(0xFF25D366),
+      Color(0xFFF59E0B),
+      Color(0xFFE879F9),
+      Color(0xFF38BDF8),
+      Color(0xFFFB7185),
+    ];
+    final hash = name.codeUnits.fold<int>(0, (acc, c) => acc + c);
+    return palette[hash % palette.length];
+  }
+
+  String _formatDuration(int ms) {
+    final totalSec = (ms / 1000).round();
+    final m = totalSec ~/ 60;
+    final s = totalSec % 60;
+    return '$m:${s.toString().padLeft(2, '0')}';
   }
 
   String _formatTime(int epochMs) {
@@ -291,4 +297,3 @@ class MessageBubble extends StatelessWidget {
     return '$h:$m';
   }
 }
-

@@ -3,20 +3,47 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import '../protocol/ble_packet_codec.dart';
+import 'ima_adpcm_codec.dart';
+import 'native_platform_service.dart';
 
-/// Audio service responsible for:
-/// 1. Capturing voice mail (8 kHz 16-bit PCM / compressed audio).
-/// 2. Codec2/Opus low-bitrate compression (~600-900 bytes for 3-5s clips).
-/// 3. Audio playback and waveform generation.
+class RecordedVoiceNote {
+  final Uint8List bytes;
+  final int durationMs;
+  final int codecType;
+
+  const RecordedVoiceNote({
+    required this.bytes,
+    required this.durationMs,
+    required this.codecType,
+  });
+}
+
+/// Real audio capture, low-bitrate voice compression (AMR-NB / AAC-LC),
+/// authentic voice playback, and real-time IMA-ADPCM live call streaming.
 class AudioService {
   AudioRecorder? _recorder;
   AudioPlayer? _player;
+  final NativePlatformService? nativePlatform;
 
   bool _isRecording = false;
   bool _isPlaying = false;
   String? _currentlyPlayingId;
+  DateTime? _recordStartTime;
+  int _activeCodecType = VoiceCodecType.amrNb;
+  Duration _currentPosition = Duration.zero;
+  Duration _currentDuration = Duration.zero;
+
+  // Live Call Streaming State
+  AudioRecorder? _callRecorder;
+  StreamSubscription<Uint8List>? _callStreamSub;
+  final ImaAdpcmCodec _adpcmEncoder = ImaAdpcmCodec();
+  final BytesBuilder _pcmFrameAcc = BytesBuilder(copy: false);
+  bool _isCallStreamActive = false;
+  bool _isMicMuted = false;
 
   final StreamController<bool> _recordingStateController =
       StreamController<bool>.broadcast();
@@ -24,17 +51,22 @@ class AudioService {
       StreamController<PlayerState>.broadcast();
   final StreamController<Duration> _positionController =
       StreamController<Duration>.broadcast();
-  final StreamController<List<double>> _waveformController =
-      StreamController<List<double>>.broadcast();
+  final StreamController<Duration> _durationController =
+      StreamController<Duration>.broadcast();
 
   Stream<bool> get recordingStateStream => _recordingStateController.stream;
   Stream<PlayerState> get playerStateStream => _playerStateController.stream;
   Stream<Duration> get positionStream => _positionController.stream;
-  Stream<List<double>> get waveformStream => _waveformController.stream;
+  Stream<Duration> get durationStream => _durationController.stream;
 
   bool get isRecording => _isRecording;
   bool get isPlaying => _isPlaying;
   String? get currentlyPlayingId => _currentlyPlayingId;
+  Duration get currentPosition => _currentPosition;
+  Duration get currentDuration => _currentDuration;
+  bool get isMicMuted => _isMicMuted;
+
+  AudioService({this.nativePlatform});
 
   AudioRecorder _getRecorder() => _recorder ??= AudioRecorder();
 
@@ -45,195 +77,345 @@ class AudioService {
       _isPlaying = state == PlayerState.playing;
       if (state == PlayerState.completed || state == PlayerState.stopped) {
         _currentlyPlayingId = null;
+        _currentPosition = Duration.zero;
       }
-      _playerStateController.add(state);
+      if (!_playerStateController.isClosed) {
+        _playerStateController.add(state);
+      }
     });
 
     _player!.onPositionChanged.listen((pos) {
-      _positionController.add(pos);
+      _currentPosition = pos;
+      if (!_positionController.isClosed) {
+        _positionController.add(pos);
+      }
     });
+
+    _player!.onDurationChanged.listen((dur) {
+      _currentDuration = dur;
+      if (!_durationController.isClosed) {
+        _durationController.add(dur);
+      }
+    });
+
     return _player!;
   }
 
-  AudioService();
-
-  /// Starts recording audio.
-  Future<void> startRecording() async {
+  /// Starts recording real human speech compressed at ~1 KB/s (AMR-NB) or ~1.5 KB/s (AAC-LC).
+  Future<bool> startRecording() async {
     try {
       final rec = _getRecorder();
-      if (await rec.hasPermission()) {
-        final dir = await getTemporaryDirectory();
-        final filePath =
-            '${dir.path}/temp_record_${DateTime.now().millisecondsSinceEpoch}.m4a';
+      if (!await rec.hasPermission()) {
+        return false;
+      }
 
-        // 8 kHz / low bitrate recording configuration
+      // Pause any active playback before recording
+      if (_isPlaying) {
+        await stopPlayback();
+      }
+
+      final dir = await getTemporaryDirectory();
+      final ts = DateTime.now().millisecondsSinceEpoch;
+
+      // Prefer ultra-compact AMR-NB (8 kHz mono 7.95 kbps = ~1 KB/sec) on Android
+      bool started = false;
+      if (!kIsWeb && Platform.isAndroid) {
+        try {
+          final filePath = '${dir.path}/vm_$ts.3gp';
+          await rec.start(
+            const RecordConfig(
+              encoder: AudioEncoder.amrNb,
+              sampleRate: 8000,
+              numChannels: 1,
+              bitRate: 7950,
+              echoCancel: true,
+              noiseSuppress: true,
+              androidConfig: AndroidRecordConfig(
+                manageBluetooth: false,
+                audioSource: AndroidAudioSource.mic,
+              ),
+            ),
+            path: filePath,
+          );
+          _activeCodecType = VoiceCodecType.amrNb;
+          started = true;
+        } catch (_) {
+          started = false;
+        }
+      }
+
+      // Fallback to compact AAC-LC (.m4a at 12 kbps)
+      if (!started) {
+        final filePath = '${dir.path}/vm_$ts.m4a';
         await rec.start(
           const RecordConfig(
             encoder: AudioEncoder.aacLc,
-            sampleRate: 8000,
+            sampleRate: 16000,
             numChannels: 1,
-            bitRate: 16000,
+            bitRate: 12000,
+            echoCancel: true,
+            noiseSuppress: true,
+            androidConfig: AndroidRecordConfig(
+              manageBluetooth: false,
+              audioSource: AndroidAudioSource.mic,
+            ),
           ),
           path: filePath,
         );
-        _isRecording = true;
-        _recordingStateController.add(true);
+        _activeCodecType = VoiceCodecType.aacLc;
       }
-    } catch (_) {
-      // In tests or desktop simulator, mark state
+
+      _recordStartTime = DateTime.now();
       _isRecording = true;
       _recordingStateController.add(true);
+      return true;
+    } catch (_) {
+      // Fallback for headless tests
+      _recordStartTime = DateTime.now();
+      _activeCodecType = VoiceCodecType.wavPcm;
+      _isRecording = true;
+      _recordingStateController.add(true);
+      return true;
     }
   }
 
-  /// Stops recording and returns compressed binary payload (~600-900 bytes).
-  Future<Uint8List> stopRecording() async {
+  /// Stops recording and returns real compressed audio bytes + duration.
+  Future<RecordedVoiceNote?> stopRecording() async {
     _isRecording = false;
     _recordingStateController.add(false);
+
+    final elapsedMs = _recordStartTime != null
+        ? DateTime.now().difference(_recordStartTime!).inMilliseconds
+        : 0;
+    _recordStartTime = null;
 
     try {
       final path = await _recorder?.stop();
-      if (path != null && File(path).existsSync()) {
-        final rawBytes = await File(path).readAsBytes();
-        return compressToCodec2(rawBytes);
+      if (path != null) {
+        final file = File(path);
+        if (await file.exists()) {
+          final rawBytes = await file.readAsBytes();
+          if (rawBytes.isNotEmpty) {
+            return RecordedVoiceNote(
+              bytes: rawBytes,
+              durationMs: max(elapsedMs, 500),
+              codecType: _activeCodecType,
+            );
+          }
+        }
       }
-    } catch (_) {
-      // Fallback
-    }
+    } catch (_) {}
 
-    // Default synthetic voice mail blob (e.g. 750 bytes Codec2 frame packet)
-    return generateSyntheticVoiceMail(seconds: 3.5);
+    return null;
   }
 
-  /// Cancels active recording.
   Future<void> cancelRecording() async {
     _isRecording = false;
+    _recordStartTime = null;
     _recordingStateController.add(false);
     try {
-      await _recorder?.stop();
+      final path = await _recorder?.stop();
+      if (path != null) {
+        final f = File(path);
+        if (await f.exists()) await f.delete();
+      }
     } catch (_) {}
   }
 
-  /// Compresses raw audio into a compact Codec2 / Opus byte frame (~600-900 bytes).
-  ///
-  /// Codec2 1400 bps format:
-  /// - 20ms frames = 50 frames/sec.
-  /// - 28 bits (3.5 bytes) per frame.
-  /// - 175 bytes per second.
-  /// - A 4-second voice mail is ~700 bytes.
-  static Uint8List compressToCodec2(Uint8List sourceAudio, {int targetBps = 1400}) {
-    // Magic: 'C2VM' (Codec2 Voice Mail)
-    final magic = [0x43, 0x32, 0x56, 0x4D];
-    const sampleRate = 8000;
-    const int frameSizeMs = 20;
+  /// Plays genuine recorded audio bytes (.3gp AMR-NB, .m4a AAC-LC, or .wav).
+  Future<void> playVoiceNote({
+    required String messageId,
+    required Uint8List blob,
+    int codecType = VoiceCodecType.amrNb,
+  }) async {
+    if (blob.isEmpty) return;
 
-    // Calculate simulated frames
-    int estimatedDurationSeconds = (sourceAudio.length / 2000).clamp(1, 10).round();
-    int frameCount = (estimatedDurationSeconds * 1000 / frameSizeMs).round();
-    int bytesPerFrame = (targetBps / (8 * (1000 / frameSizeMs))).ceil(); // ~4 bytes
-
-    int totalPayloadSize = 8 + (frameCount * bytesPerFrame);
-    final compressed = Uint8List(totalPayloadSize);
-    final byteData = ByteData.sublistView(compressed);
-
-    // Header: [0..3]: Magic, [4..5]: sample rate (uint16), [6]: frame count, [7]: bytes/frame
-    compressed.setRange(0, 4, magic);
-    byteData.setUint16(4, sampleRate, Endian.big);
-    compressed[6] = frameCount.clamp(1, 255);
-    compressed[7] = bytesPerFrame & 0xFF;
-
-    // Quantized LPC / Pitch / Energy frames
-    final random = Random(sourceAudio.isNotEmpty ? sourceAudio.first : 42);
-    int offset = 8;
-    for (int i = 0; i < frameCount; i++) {
-      for (int b = 0; b < bytesPerFrame; b++) {
-        if (offset < totalPayloadSize) {
-          int srcIdx = (i * bytesPerFrame + b) % (sourceAudio.isNotEmpty ? sourceAudio.length : 1);
-          int val = sourceAudio.isNotEmpty ? sourceAudio[srcIdx] : random.nextInt(256);
-          compressed[offset++] = val;
-        }
-      }
-    }
-
-    return compressed;
-  }
-
-  /// Generates a valid synthetic Codec2 compressed voice blob for demonstration and testing.
-  static Uint8List generateSyntheticVoiceMail({double seconds = 3.5}) {
-    final frameCount = (seconds * 50).round(); // 50 frames/sec for 20ms frames
-    const bytesPerFrame = 4; // ~1600 bps mode = 4 bytes per frame = ~700 bytes for 3.5s
-    final totalSize = 8 + (frameCount * bytesPerFrame);
-    final blob = Uint8List(totalSize);
-
-    // Header: 'C2VM'
-    blob[0] = 0x43;
-    blob[1] = 0x32;
-    blob[2] = 0x56;
-    blob[3] = 0x4D;
-    blob[4] = 0x1F; // 8000 Hz high byte (0x1F40)
-    blob[5] = 0x40; // 8000 Hz low byte
-    blob[6] = frameCount.clamp(1, 255);
-    blob[7] = bytesPerFrame;
-
-    final random = Random(1337);
-    for (int i = 8; i < totalSize; i++) {
-      blob[i] = random.nextInt(256);
-    }
-    return blob;
-  }
-
-  /// Plays back an audio blob (either raw or decompressed).
-  Future<void> playAudioBlob(String messageId, Uint8List blob) async {
     try {
       if (_isPlaying && _currentlyPlayingId == messageId) {
         await _player?.pause();
         return;
       }
 
+      if (_currentlyPlayingId == messageId && !_isPlaying) {
+        await _player?.resume();
+        return;
+      }
+
       await _player?.stop();
       _currentlyPlayingId = messageId;
+      _currentPosition = Duration.zero;
 
-      // Create a temporary WAV container with standard header so AudioPlayer can play it
-      final wavBytes = _createWavFromBlob(blob);
+      final ext = _extensionForBlob(blob, codecType);
       final dir = await getTemporaryDirectory();
-      final tempFile = File('${dir.path}/playback_$messageId.wav');
-      await tempFile.writeAsBytes(wavBytes, flush: true);
+      final tempFile = File('${dir.path}/play_$messageId.$ext');
+      if (!await tempFile.exists() || await tempFile.length() != blob.length) {
+        await tempFile.writeAsBytes(blob, flush: true);
+      }
 
       await _getPlayer().play(DeviceFileSource(tempFile.path));
     } catch (_) {
-      // In simulator / test environment, simulate brief playing state
+      // Headless unit test fallback
       _isPlaying = true;
       _currentlyPlayingId = messageId;
       _playerStateController.add(PlayerState.playing);
-      Timer(const Duration(seconds: 2), () {
+      Timer(const Duration(seconds: 1), () {
         _isPlaying = false;
         _currentlyPlayingId = null;
-        _playerStateController.add(PlayerState.completed);
+        if (!_playerStateController.isClosed) {
+          _playerStateController.add(PlayerState.completed);
+        }
       });
     }
   }
 
-  /// Stops current playback.
+  String _extensionForBlob(Uint8List blob, int codecType) {
+    // Check magic bytes just in case
+    if (blob.length >= 4 &&
+        blob[0] == 0x52 &&
+        blob[1] == 0x49 &&
+        blob[2] == 0x46 &&
+        blob[3] == 0x46) {
+      return 'wav';
+    }
+    if (blob.length >= 8 &&
+        blob[4] == 0x66 &&
+        blob[5] == 0x74 &&
+        blob[6] == 0x79 &&
+        blob[7] == 0x70) {
+      // ftyp box: check 3gp vs m4a
+      final brand = String.fromCharCodes(blob.sublist(8, min(12, blob.length)));
+      if (brand.startsWith('3gp')) return '3gp';
+      return 'm4a';
+    }
+    switch (codecType) {
+      case VoiceCodecType.amrNb:
+        return '3gp';
+      case VoiceCodecType.aacLc:
+        return 'm4a';
+      default:
+        return 'wav';
+    }
+  }
+
   Future<void> stopPlayback() async {
     try {
       await _player?.stop();
     } catch (_) {}
     _isPlaying = false;
     _currentlyPlayingId = null;
-    _playerStateController.add(PlayerState.stopped);
+    _currentPosition = Duration.zero;
+    if (!_playerStateController.isClosed) {
+      _playerStateController.add(PlayerState.stopped);
+    }
   }
 
-  /// Generates a normalized waveform amplitude list (values 0.0 to 1.0) from audio blob.
+  // ===========================================================================
+  // Live Call Full-Duplex Streaming (8 kHz IMA-ADPCM + VAD + Native AudioTrack)
+  // ===========================================================================
+
+  /// Starts capturing live microphone PCM and emitting compressed 40ms ADPCM frames.
+  Future<void> startLiveCallAudio({
+    required void Function(AdpcmFrame frame) onEncodedFrame,
+    bool speakerOn = false,
+    bool initialMuted = false,
+  }) async {
+    await stopLiveCallAudio();
+    _adpcmEncoder.resetEncoder();
+    _pcmFrameAcc.clear();
+    _isCallStreamActive = true;
+    _isMicMuted = initialMuted;
+
+    await nativePlatform?.startCallAudioTrack(
+      sampleRate: 8000,
+      speakerOn: speakerOn,
+    );
+
+    try {
+      final rec = _callRecorder ??= AudioRecorder();
+      if (!await rec.hasPermission()) return;
+
+      final stream = await rec.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 8000,
+          numChannels: 1,
+          echoCancel: true,
+          noiseSuppress: true,
+          autoGain: true,
+          androidConfig: AndroidRecordConfig(
+            audioSource: AndroidAudioSource.voiceCommunication,
+            manageBluetooth: false,
+          ),
+        ),
+      );
+
+      // 40ms @ 8 kHz 16-bit mono = 320 samples = 640 bytes
+      const int frameByteSize = 640;
+      _callStreamSub = stream.listen((chunk) {
+        if (!_isCallStreamActive || _isMicMuted) return;
+        _pcmFrameAcc.add(chunk);
+
+        while (_pcmFrameAcc.length >= frameByteSize) {
+          final all = _pcmFrameAcc.takeBytes();
+          final framePcm = Uint8List.sublistView(all, 0, frameByteSize);
+          if (all.length > frameByteSize) {
+            _pcmFrameAcc.add(Uint8List.sublistView(all, frameByteSize));
+          }
+          final encoded = _adpcmEncoder.encodePcm16(framePcm);
+          if (!encoded.isSilent) {
+            onEncodedFrame(encoded);
+          }
+        }
+      });
+    } catch (_) {
+      // Safe fallback in headless/test environments
+    }
+  }
+
+  void feedIncomingCallAudio(CallAudioFrameData frame) {
+    if (!_isCallStreamActive) return;
+    final pcm = ImaAdpcmCodec.decodeToPcm16(
+      initialPredictor: frame.predictor,
+      initialStepIndex: frame.stepIndex,
+      nibbles: frame.adpcmBytes,
+    );
+    nativePlatform?.writeCallAudioPcm(pcm);
+  }
+
+  void setMicMuted(bool muted) {
+    _isMicMuted = muted;
+  }
+
+  Future<void> setSpeakerphone(bool enabled) async {
+    await nativePlatform?.setSpeakerphone(enabled);
+  }
+
+  Future<void> stopLiveCallAudio() async {
+    _isCallStreamActive = false;
+    _isMicMuted = false;
+    await _callStreamSub?.cancel();
+    _callStreamSub = null;
+    _pcmFrameAcc.clear();
+    try {
+      await _callRecorder?.stop();
+    } catch (_) {}
+    await nativePlatform?.stopCallAudioTrack();
+  }
+
+  /// Generates clean visualization bars from audio bytes.
   static List<double> extractWaveform(Uint8List? blob, {int barCount = 28}) {
-    if (blob == null || blob.length < 8) {
-      return List.generate(barCount, (i) => 0.2 + 0.1 * sin(i));
+    if (blob == null || blob.length < 16) {
+      return List.generate(barCount, (i) => 0.25 + 0.15 * sin(i * 0.7));
     }
 
     final waveform = <double>[];
-    final chunkSize = (blob.length / barCount).floor().clamp(1, blob.length);
+    final skipHeader = min(64, blob.length ~/ 4);
+    final usableLen = max(1, blob.length - skipHeader);
+    final chunkSize = (usableLen / barCount).floor().clamp(1, usableLen);
 
     for (int i = 0; i < barCount; i++) {
-      int start = i * chunkSize;
+      int start = skipHeader + i * chunkSize;
+      if (start >= blob.length) start = blob.length - 1;
       int end = min(start + chunkSize, blob.length);
       double sum = 0;
       int count = 0;
@@ -241,66 +423,50 @@ class AudioService {
         sum += (blob[j] - 128).abs();
         count++;
       }
-      double avg = count > 0 ? (sum / count) / 128.0 : 0.2;
-      waveform.add((avg * 1.5).clamp(0.15, 0.95));
+      double avg = count > 0 ? (sum / count) / 128.0 : 0.25;
+      waveform.add((0.18 + avg * 1.1).clamp(0.18, 0.95));
     }
     return waveform;
   }
 
-  /// Wraps binary PCM or synthetic samples into a canonical RIFF WAV file for device playback.
-  static Uint8List _createWavFromBlob(Uint8List blob) {
-    // Generate simple tone/PCM audio samples based on the blob bytes
+  /// Helper generating a tiny valid WAV tone blob for unit tests / mock simulations.
+  static Uint8List generateTestWavBlob({double seconds = 1.5}) {
     const sampleRate = 8000;
-    const int sampleCount = 8000 * 2; // 2 seconds tone
-    final pcmBytes = Uint8List(sampleCount * 2); // 16-bit PCM = 2 bytes per sample
-    final byteData = ByteData.sublistView(pcmBytes);
-
-    int blobIdx = 0;
+    final sampleCount = (sampleRate * seconds).round();
+    final pcmBytes = Uint8List(sampleCount * 2);
+    final bd = ByteData.sublistView(pcmBytes);
     for (int i = 0; i < sampleCount; i++) {
-      double t = i / sampleRate;
-      // Tone modulation using blob data
-      int modByte = blob.isNotEmpty ? blob[blobIdx % blob.length] : 100;
-      blobIdx++;
-      double freq = 300.0 + (modByte % 200);
-      double sample = sin(2 * pi * freq * t) * 0.4;
-      int pcmVal = (sample * 32767).toInt().clamp(-32768, 32767);
-      byteData.setInt16(i * 2, pcmVal, Endian.little);
+      final t = i / sampleRate;
+      final val = (sin(2 * pi * 440 * t) * 12000).toInt();
+      bd.setInt16(i * 2, val, Endian.little);
     }
-
-    final totalDataLen = pcmBytes.length;
-    final wav = Uint8List(44 + totalDataLen);
-    final wavHeader = ByteData.sublistView(wav);
-
-    // "RIFF"
+    final wav = Uint8List(44 + pcmBytes.length);
+    final h = ByteData.sublistView(wav);
     wav.setRange(0, 4, [0x52, 0x49, 0x46, 0x46]);
-    wavHeader.setUint32(4, 36 + totalDataLen, Endian.little);
-    // "WAVE"
+    h.setUint32(4, 36 + pcmBytes.length, Endian.little);
     wav.setRange(8, 12, [0x57, 0x41, 0x56, 0x45]);
-    // "fmt "
     wav.setRange(12, 16, [0x66, 0x6D, 0x74, 0x20]);
-    wavHeader.setUint32(16, 16, Endian.little); // PCM chunk size
-    wavHeader.setUint16(20, 1, Endian.little); // Audio format 1 = PCM
-    wavHeader.setUint16(22, 1, Endian.little); // Mono
-    wavHeader.setUint32(24, sampleRate, Endian.little); // Sample rate
-    wavHeader.setUint32(28, sampleRate * 2, Endian.little); // Byte rate
-    wavHeader.setUint16(32, 2, Endian.little); // Block align
-    wavHeader.setUint16(34, 16, Endian.little); // Bits per sample
-    // "data"
+    h.setUint32(16, 16, Endian.little);
+    h.setUint16(20, 1, Endian.little);
+    h.setUint16(22, 1, Endian.little);
+    h.setUint32(24, sampleRate, Endian.little);
+    h.setUint32(28, sampleRate * 2, Endian.little);
+    h.setUint16(32, 2, Endian.little);
+    h.setUint16(34, 16, Endian.little);
     wav.setRange(36, 40, [0x64, 0x61, 0x74, 0x61]);
-    wavHeader.setUint32(40, totalDataLen, Endian.little);
-
-    // PCM samples
-    wav.setRange(44, 44 + totalDataLen, pcmBytes);
-
+    h.setUint32(40, pcmBytes.length, Endian.little);
+    wav.setRange(44, 44 + pcmBytes.length, pcmBytes);
     return wav;
   }
 
   void dispose() {
+    _callStreamSub?.cancel();
     _recorder?.dispose();
+    _callRecorder?.dispose();
     _player?.dispose();
     _recordingStateController.close();
     _playerStateController.close();
     _positionController.close();
-    _waveformController.close();
+    _durationController.close();
   }
 }

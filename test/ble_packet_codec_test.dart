@@ -1,140 +1,224 @@
-import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:message_mail/protocol/ble_packet_codec.dart';
+import 'package:message_mail/services/ima_adpcm_codec.dart';
 
 void main() {
-  group('BlePacketCodec Protocol Framing Tests', () {
-    const testUuid = 'c73bcdcc-66b7-4d2b-9dd7-25e1a7b4582e';
-    const testRecipient = 'NODE-P01';
+  const testUuid = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+  const callUuid = '12345678-90ab-cdef-1234-567890abcdef';
 
-    test('Round-trip serialization of UTF-8 Text Packet', () {
-      const textMessage = 'Mesh coordinates: 37.7749 N, 122.4194 W. Battery 94%.';
+  group('Protocol v2 BlePacketCodec & Compression Tests', () {
+    test('normalizeUsername sanitizes display names into clean ASCII handles', () {
+      expect(BlePacketCodec.normalizeUsername('Harshil Patel'), equals('harshil_patel'));
+      expect(BlePacketCodec.normalizeUsername('  Taksh#99!!  '), equals('taksh99'));
+      expect(
+        BlePacketCodec.normalizeUsername('VeryLongUsernameExceedingTwentyFourCharacters').length,
+        equals(BlePacketCodec.maxIdLength),
+      );
+    });
 
+    test('Short text skips compression and roundtrips cleanly with sender & target', () {
       final encoded = BlePacketCodec.encodeText(
         messageId: testUuid,
-        recipientId: testRecipient,
-        text: textMessage,
+        senderId: 'harshil',
+        targetId: 'taksh',
+        text: 'Hi Taksh!',
       );
 
-      // Verify framing dimensions:
-      // Header = 27 bytes: 16 (UUID) + 1 (Type) + 8 (Recipient) + 2 (Length)
-      final expectedPayloadLen = utf8.encode(textMessage).length;
-      expect(encoded.length, equals(BlePacketCodec.headerLength + expectedPayloadLen));
-
-      // Verify Payload Type Flag (0x01 = UTF-8 Text)
-      expect(encoded[16], equals(BlePayloadFlag.utf8Text));
-
-      // Verify Length bytes Big Endian
-      final byteData = ByteData.sublistView(encoded);
-      expect(byteData.getUint16(25, Endian.big), equals(expectedPayloadLen));
-
-      // Decode and verify round-trip integrity
       final decoded = BlePacketCodec.decode(encoded);
-      expect(decoded.messageId.toLowerCase(), equals(testUuid.toLowerCase()));
-      expect(decoded.payloadTypeFlag, equals(BlePayloadFlag.utf8Text));
-      expect(decoded.recipientId, equals(testRecipient));
-      expect(decoded.textContent, equals(textMessage));
+      expect(decoded.version, equals(BlePacketCodec.protocolVersion));
       expect(decoded.isText, isTrue);
-      expect(decoded.isVoice, isFalse);
+      expect(decoded.isCompressed, isFalse);
+      expect(decoded.isGroup, isFalse);
+      expect(decoded.messageId, equals(testUuid));
+      expect(decoded.senderId, equals('harshil'));
+      expect(decoded.targetId, equals('taksh'));
+      expect(decoded.textContent, equals('Hi Taksh!'));
     });
 
-    test('Round-trip serialization of Compressed Binary Voice Chunk', () {
-      // 720-byte synthetic Codec2 compressed frame buffer
-      final rawVoiceBlob = Uint8List(720);
-      for (int i = 0; i < rawVoiceBlob.length; i++) {
-        rawVoiceBlob[i] = (i * 7 + 13) % 256;
+    test('Repetitive longer text enables Raw-Deflate compression and shrinks packet size', () {
+      const longMsg = 'Meet at Base Camp Gate 2 at 18:30. '
+          'Bring extra water, flashlight, and spare batteries! '
+          'Meet at Base Camp Gate 2 at 18:30. Check in when ready.';
+      final encoded = BlePacketCodec.encodeText(
+        messageId: testUuid,
+        senderId: 'harshil',
+        targetId: 'g_trek123',
+        text: longMsg,
+        isGroup: true,
+      );
+
+      final rawUtf8Length = longMsg.length;
+      final headerLen = BlePacketCodec.minHeaderLength + 'harshil'.length + 'g_trek123'.length;
+      expect(encoded.length, lessThan(headerLen + rawUtf8Length));
+
+      final decoded = BlePacketCodec.decode(encoded);
+      expect(decoded.isCompressed, isTrue);
+      expect(decoded.isGroup, isTrue);
+      expect(decoded.textContent, equals(longMsg));
+    });
+
+    test('Voice chunks split large audio blobs into <= 440 byte BLE packets and reassemble', () {
+      final fakeAudio = Uint8List.fromList(List.generate(1250, (i) => (i * 13) % 256));
+      final chunks = BlePacketCodec.encodeVoiceChunks(
+        messageId: testUuid,
+        senderId: 'harshil',
+        targetId: 'taksh',
+        audioBlob: fakeAudio,
+        durationMs: 3200,
+        codecType: VoiceCodecType.amrNb,
+        isGroup: false,
+      );
+
+      expect(chunks.length, equals(4)); // 360 + 360 + 360 + 170 = 1250
+      final reassembled = BytesBuilder();
+
+      for (int i = 0; i < chunks.length; i++) {
+        expect(chunks[i].length, lessThanOrEqualTo(440));
+        final pkt = BlePacketCodec.decode(chunks[i]);
+        expect(pkt.isVoice, isTrue);
+        expect(pkt.flags & BlePacketFlags.chunked, isNonZero);
+
+        final chunk = BlePacketCodec.decodeVoiceChunk(pkt.payload);
+        expect(chunk.chunkIndex, equals(i));
+        expect(chunk.totalChunks, equals(4));
+        expect(chunk.durationMs, equals(3200));
+        expect(chunk.codecType, equals(VoiceCodecType.amrNb));
+        reassembled.add(chunk.chunkBytes);
       }
 
-      final encoded = BlePacketCodec.encodeVoice(
-        messageId: testUuid,
-        recipientId: 'NODE-P2',
-        audioBlob: rawVoiceBlob,
-      );
-
-      expect(encoded.length, equals(BlePacketCodec.headerLength + 720));
-      expect(encoded[16], equals(BlePayloadFlag.voiceChunk));
-
-      final decoded = BlePacketCodec.decode(encoded);
-      expect(decoded.messageId.toLowerCase(), equals(testUuid.toLowerCase()));
-      expect(decoded.payloadTypeFlag, equals(BlePayloadFlag.voiceChunk));
-      expect(decoded.recipientId, equals('NODE-P2'));
-      expect(decoded.payload, equals(rawVoiceBlob));
-      expect(decoded.isVoice, isTrue);
-      expect(decoded.isText, isFalse);
+      expect(reassembled.toBytes(), equals(fakeAudio));
     });
 
-    test('Round-trip serialization of Delivery ACK Packet', () {
-      final encoded = BlePacketCodec.encodeAck(
-        messageId: testUuid,
-        recipientId: 'NODE-P3',
-        statusCode: 0x01, // DELIVERED
+    test('PresenceHello, PeerDirectory, and GroupMeta roundtrip accurately', () {
+      final helloBytes = BlePacketCodec.encodePresenceHello(
+        deviceUuid: testUuid,
+        username: 'harshil',
+        displayName: 'Harshil',
       );
+      final helloPkt = BlePacketCodec.decode(helloBytes);
+      expect(helloPkt.isPresence, isTrue);
+      expect(helloPkt.senderId, equals('harshil'));
+      expect(helloPkt.targetId, equals('RELAY'));
+      expect(helloPkt.textContent, equals('Harshil'));
 
-      expect(encoded.length, equals(BlePacketCodec.headerLength + 1));
-      expect(encoded[16], equals(BlePayloadFlag.deliveryAck));
-      expect(encoded[27], equals(0x01));
+      final groupBytes = BlePacketCodec.encodeGroupMeta(
+        messageId: testUuid,
+        senderId: 'harshil',
+        groupId: 'g_123456',
+        groupName: 'Mountain Rescue',
+        members: ['harshil', 'Taksh', 'Priya'],
+      );
+      final groupPkt = BlePacketCodec.decode(groupBytes);
+      expect(groupPkt.isGroupMeta, isTrue);
+      expect(groupPkt.isGroup, isTrue);
+      final decodedGroup = BlePacketCodec.decodeGroupMeta(groupPkt.targetId, groupPkt.payload);
+      expect(decodedGroup.groupId, equals('g_123456'));
+      expect(decodedGroup.groupName, equals('Mountain Rescue'));
+      expect(decodedGroup.members, containsAll(['harshil', 'taksh', 'priya']));
 
-      final decoded = BlePacketCodec.decode(encoded);
-      expect(decoded.messageId.toLowerCase(), equals(testUuid.toLowerCase()));
-      expect(decoded.payloadTypeFlag, equals(BlePayloadFlag.deliveryAck));
-      expect(decoded.recipientId, equals('NODE-P3'));
-      expect(decoded.payload[0], equals(0x01));
-      expect(decoded.isAck, isTrue);
+      // Synthetic directory payload check
+      final dirPayload = BytesBuilder()
+        ..addByte(0)
+        ..addByte(1)
+        ..addByte(2)
+        ..addByte(7)
+        ..add('harshil'.codeUnits)
+        ..addByte(7)
+        ..add('Harshil'.codeUnits)
+        ..addByte(1)
+        ..addByte(5)
+        ..add('taksh'.codeUnits)
+        ..addByte(5)
+        ..add('Taksh'.codeUnits)
+        ..addByte(0);
+      final dir = BlePacketCodec.decodePeerDirectory(dirPayload.toBytes());
+      expect(dir.page, equals(0));
+      expect(dir.totalPages, equals(1));
+      expect(dir.peers.length, equals(2));
+      expect(dir.peers[0].isOnline, isTrue);
+      expect(dir.peers[1].username, equals('taksh'));
+      expect(dir.peers[1].isOnline, isFalse);
     });
 
-    test('UUID 16-byte conversion maintains exact bit layout', () {
-      final packet = BlePacket(
-        messageId: '00112233-4455-6677-8899-aabbccddeeff',
-        payloadTypeFlag: BlePayloadFlag.utf8Text,
-        recipientId: 'N1',
-        payload: Uint8List(0),
+    test('CallSignal and CallAudio ADPCM packets encode & decode cleanly', () {
+      final sigBytes = BlePacketCodec.encodeCallSignal(
+        callId: callUuid,
+        senderId: 'harshil',
+        targetId: 'taksh',
+        signalCode: CallSignalCode.invite,
       );
+      final sigPkt = BlePacketCodec.decode(sigBytes);
+      expect(sigPkt.isCallSignal, isTrue);
+      expect(sigPkt.messageId, equals(callUuid));
+      expect(sigPkt.payload[0], equals(CallSignalCode.invite));
 
-      final encoded = BlePacketCodec.encode(packet);
-      final uuidSlice = encoded.sublist(0, 16);
+      final nibbles = Uint8List.fromList(List.generate(160, (i) => i & 0xFF));
+      final audioBytes = BlePacketCodec.encodeCallAudio(
+        callId: callUuid,
+        senderId: 'harshil',
+        targetId: 'taksh',
+        seqNum: 42,
+        predictor: -1250,
+        stepIndex: 18,
+        frameMs: 40,
+        adpcmBytes: nibbles,
+      );
+      final audioPkt = BlePacketCodec.decode(audioBytes);
+      expect(audioPkt.isCallAudio, isTrue);
+      expect(audioPkt.isCompressed, isTrue);
 
-      expect(uuidSlice, equals(Uint8List.fromList([
-        0x00, 0x11, 0x22, 0x33,
-        0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xAA, 0xBB,
-        0xCC, 0xDD, 0xEE, 0xFF,
-      ])));
-
-      final decoded = BlePacketCodec.decode(encoded);
-      expect(decoded.messageId, equals('00112233-4455-6677-8899-aabbccddeeff'));
+      final parsedFrame = BlePacketCodec.decodeCallAudio(audioPkt.payload);
+      expect(parsedFrame.seqNum, equals(42));
+      expect(parsedFrame.predictor, equals(-1250));
+      expect(parsedFrame.stepIndex, equals(18));
+      expect(parsedFrame.frameMs, equals(40));
+      expect(parsedFrame.adpcmBytes, equals(nibbles));
     });
 
-    test('Recipient field handles 8-byte padding and trimming cleanly', () {
-      final shortRecipient = 'P1';
-      final encodedShort = BlePacketCodec.encodeText(
+    test('Throws FormatException on short or wrong-version packets', () {
+      expect(() => BlePacketCodec.decode(Uint8List(10)), throwsA(isA<FormatException>()));
+
+      final wrongVer = BlePacketCodec.encodeText(
         messageId: testUuid,
-        recipientId: shortRecipient,
+        senderId: 'a',
+        targetId: 'b',
         text: 'hello',
       );
-      final decodedShort = BlePacketCodec.decode(encodedShort);
-      expect(decodedShort.recipientId, equals('P1'));
-
-      final exactRecipient = 'NODE-P06'; // exactly 8 chars
-      final encodedExact = BlePacketCodec.encodeText(
-        messageId: testUuid,
-        recipientId: exactRecipient,
-        text: 'hello',
-      );
-      final decodedExact = BlePacketCodec.decode(encodedExact);
-      expect(decodedExact.recipientId, equals('NODE-P06'));
+      wrongVer[0] = 0x01;
+      expect(() => BlePacketCodec.decode(wrongVer), throwsA(isA<FormatException>()));
     });
+  });
 
-    test('Throws FormatException on truncated packets', () {
-      // Shorter than 27-byte header
-      final tooShort = Uint8List(20);
-      expect(() => BlePacketCodec.decode(tooShort), throwsA(isA<FormatException>()));
+  group('IMA-ADPCM Live Voice Compression & VAD Tests', () {
+    test('Silence frame is suppressed by VAD while speech sine wave compresses 4:1', () {
+      final encoder = ImaAdpcmCodec();
 
-      // Header indicates 50-byte payload, but only 10 bytes provided
-      final headerWithLongPayload = Uint8List(37);
-      ByteData.sublistView(headerWithLongPayload).setUint16(25, 50, Endian.big);
-      expect(() => BlePacketCodec.decode(headerWithLongPayload), throwsA(isA<FormatException>()));
+      // 320 samples (40ms @ 8kHz) = 640 bytes of silence
+      final silencePcm = Uint8List(640);
+      final silentFrame = encoder.encodePcm16(silencePcm);
+      expect(silentFrame.isSilent, isTrue);
+
+      // 320 samples (40ms @ 8kHz) of 500 Hz tone
+      final speechPcm = Uint8List(640);
+      final bd = ByteData.sublistView(speechPcm);
+      for (int i = 0; i < 320; i++) {
+        final v = (sin(2 * pi * 500 * (i / 8000.0)) * 14000).round();
+        bd.setInt16(i * 2, v, Endian.little);
+      }
+
+      encoder.resetEncoder();
+      final speechFrame = encoder.encodePcm16(speechPcm);
+      expect(speechFrame.isSilent, isFalse);
+      expect(speechFrame.nibbles.length, equals(160)); // Exact 4:1 compression (640 -> 160)
+
+      final restoredPcm = ImaAdpcmCodec.decodeToPcm16(
+        initialPredictor: speechFrame.initialPredictor,
+        initialStepIndex: speechFrame.initialStepIndex,
+        nibbles: speechFrame.nibbles,
+      );
+      expect(restoredPcm.length, equals(640));
     });
   });
 }
-

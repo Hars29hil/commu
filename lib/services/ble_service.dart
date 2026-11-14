@@ -1,22 +1,24 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
 import '../models/message_mail.dart';
 import '../protocol/ble_packet_codec.dart';
 import 'database_service.dart';
 
-/// GATT Constants for Heltec WiFi LoRa 32 V3 / ESP32-S3 Bridge
+/// GATT Constants matching ESP32 Firmware (`esp32_devkit_v1_relay.ino`).
 class BleGattConstants {
   static final Guid serviceUuid =
       Guid('0000A101-0000-1000-8000-00805F9B34FB');
   static final Guid charDataTx =
-      Guid('0000A102-0000-1000-8000-00805F9B34FB'); // Phone -> ESP32 Write Without Response
+      Guid('0000A102-0000-1000-8000-00805F9B34FB');
   static final Guid charDataRx =
-      Guid('0000A103-0000-1000-8000-00805F9B34FB'); // ESP32 -> Phone Notify
+      Guid('0000A103-0000-1000-8000-00805F9B34FB');
 }
 
-/// Connection states for the BLE Hardware Bridge.
 enum BleConnectionState {
   disconnected,
   scanning,
@@ -24,7 +26,6 @@ enum BleConnectionState {
   connected,
 }
 
-/// Abstract bridge allowing transparent switching between Physical BLE and Mock Engine.
 abstract class BleHardwareBridge {
   BleConnectionState get state;
   String? get connectedNodeName;
@@ -38,15 +39,19 @@ abstract class BleHardwareBridge {
   Future<bool> connectToNode(String nodeIdOrAddress);
   Future<void> disconnect();
   Future<bool> sendPacket(Uint8List frameBytes);
+  Future<bool> sendUrgentPacket(Uint8List frameBytes);
+  Future<bool> sendReliablePacket(Uint8List frameBytes);
+  Future<void> setHighPriorityConnection(bool high);
   void dispose();
 }
 
-/// Real BLE Client implementation using flutter_blue_plus.
+/// Real BLE GATT client with autonomous background radar, MTU 512 negotiation,
+/// paced chunk writes, and drop-stale urgent lane for live calling.
 class FlutterBluePlusBridge implements BleHardwareBridge {
   BleConnectionState _state = BleConnectionState.disconnected;
   String? _connectedNodeName;
   int _rssi = -85;
-  final int _pingLatencyMs = 24;
+  final int _pingLatencyMs = 20;
 
   BluetoothDevice? _connectedDevice;
   BluetoothCharacteristic? _txCharacteristic;
@@ -58,6 +63,10 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
   Timer? _rssiPollTimer;
   bool _isAutoRadarActive = true;
   bool _isConnecting = false;
+
+  // Serializes BLE writes cleanly while allowing stale-frame drop for live call audio
+  Future<void> _writeTail = Future<void>.value();
+  int _pendingUrgentWrites = 0;
 
   final StreamController<BleConnectionState> _stateController =
       StreamController<BleConnectionState>.broadcast();
@@ -84,12 +93,13 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
   void _setState(BleConnectionState newState) {
     if (_state != newState) {
       _state = newState;
-      _stateController.add(newState);
+      if (!_stateController.isClosed) {
+        _stateController.add(newState);
+      }
     }
   }
 
   void _initAutoRadar() {
-    // Monitor Bluetooth Adapter state (On/Off)
     _adapterSub = FlutterBluePlus.adapterState.listen((adapterState) {
       if (adapterState == BluetoothAdapterState.on) {
         if (_state == BleConnectionState.disconnected && !_isConnecting) {
@@ -100,7 +110,6 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
       }
     });
 
-    // Radar heartbeat timer: checks every 4 seconds if disconnected and restarts radar scan
     _radarTimer = Timer.periodic(const Duration(seconds: 4), (_) {
       if (_isAutoRadarActive &&
           _state == BleConnectionState.disconnected &&
@@ -111,8 +120,23 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
     });
   }
 
+  Future<bool> _hasScanPermissions() async {
+    try {
+      if (!kIsWeb && Platform.isAndroid) {
+        final scanGranted = await Permission.bluetoothScan.isGranted;
+        final connGranted = await Permission.bluetoothConnect.isGranted;
+        if (scanGranted && connGranted) return true;
+        // Fallback check for older Android (<12) using location permission
+        final locGranted = await Permission.location.isGranted;
+        return locGranted;
+      }
+    } catch (_) {}
+    return true;
+  }
+
   Future<void> _triggerRadarSweep() async {
     if (_state == BleConnectionState.connected || _isConnecting) return;
+    if (!await _hasScanPermissions()) return;
     try {
       final isSupported = await FlutterBluePlus.isSupported;
       if (!isSupported) return;
@@ -126,6 +150,7 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
   @override
   Future<void> startScan() async {
     if (_state == BleConnectionState.connected || _isConnecting) return;
+    if (!await _hasScanPermissions()) return;
     try {
       _setState(BleConnectionState.scanning);
 
@@ -134,20 +159,19 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
         for (final r in results) {
           final advName = r.advertisementData.advName.toUpperCase();
           final devName = r.device.platformName.toUpperCase();
-          final hasService = r.advertisementData.serviceUuids.contains(BleGattConstants.serviceUuid);
+          final hasService =
+              r.advertisementData.serviceUuids.contains(BleGattConstants.serviceUuid);
           final isMatching = hasService ||
+              advName.contains('OFFGRID') ||
               advName.contains('ESP32') ||
               advName.contains('DEVKIT') ||
               advName.contains('RELAY') ||
               advName.contains('HELTEC') ||
               advName.contains('NODE') ||
-              advName.contains('MESSAGE') ||
+              devName.contains('OFFGRID') ||
               devName.contains('ESP32') ||
               devName.contains('DEVKIT') ||
-              devName.contains('RELAY') ||
-              devName.contains('HELTEC') ||
-              devName.contains('NODE') ||
-              devName.contains('MESSAGE');
+              devName.contains('RELAY');
 
           if (isMatching && !_isConnecting && _state != BleConnectionState.connected) {
             _scanSub?.cancel();
@@ -159,7 +183,6 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
         }
       });
 
-      // Scan for 7 seconds without restrictive hardware filter to ensure 100% discovery
       await FlutterBluePlus.startScan(
         timeout: const Duration(seconds: 7),
         androidUsesFineLocation: false,
@@ -193,7 +216,6 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
       await stopScan();
       final device = BluetoothDevice.fromId(nodeIdOrAddress);
 
-      // Listen for disconnection in real time
       _deviceConnSub?.cancel();
       _deviceConnSub = device.connectionState.listen((connState) {
         if (connState == BluetoothConnectionState.disconnected) {
@@ -205,14 +227,12 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
       _connectedDevice = device;
       _connectedNodeName = device.platformName.isNotEmpty
           ? device.platformName
-          : 'NODE-${nodeIdOrAddress.substring(max(0, nodeIdOrAddress.length - 4))}';
+          : 'OFFGRID-RELAY';
 
-      // Request higher MTU for voice notes (up to 512 bytes)
       try {
         await device.requestMtu(512);
       } catch (_) {}
 
-      // Discover Heltec V3 services
       final services = await device.discoverServices();
       for (final service in services) {
         if (service.uuid == BleGattConstants.serviceUuid) {
@@ -226,7 +246,9 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
                 if (data.isNotEmpty) {
                   try {
                     final packet = BlePacketCodec.decode(Uint8List.fromList(data));
-                    _packetRxController.add(packet);
+                    if (!_packetRxController.isClosed) {
+                      _packetRxController.add(packet);
+                    }
                   } catch (_) {}
                 }
               });
@@ -235,20 +257,20 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
         }
       }
 
-      // Read initial RSSI
       try {
         _rssi = await device.readRssi();
       } catch (_) {
-        _rssi = -64;
+        _rssi = -62;
       }
 
-      // Start periodic RSSI reading while connected
       _rssiPollTimer?.cancel();
       _rssiPollTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
         if (_connectedDevice != null && _state == BleConnectionState.connected) {
           try {
             _rssi = await _connectedDevice!.readRssi();
-            _stateController.add(_state);
+            if (!_stateController.isClosed) {
+              _stateController.add(_state);
+            }
           } catch (_) {}
         }
       });
@@ -261,6 +283,19 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
       _handleDisconnection();
       return false;
     }
+  }
+
+  @override
+  Future<void> setHighPriorityConnection(bool high) async {
+    if (_connectedDevice == null || _state != BleConnectionState.connected) return;
+    try {
+      if (!kIsWeb && Platform.isAndroid) {
+        await _connectedDevice!.requestConnectionPriority(
+          connectionPriorityRequest:
+              high ? ConnectionPriority.high : ConnectionPriority.balanced,
+        );
+      }
+    } catch (_) {}
   }
 
   void _handleDisconnection() {
@@ -282,7 +317,7 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
       await _connectedDevice?.disconnect();
     } catch (_) {}
     _handleDisconnection();
-    Future.delayed(const Duration(seconds: 8), () {
+    Future.delayed(const Duration(seconds: 6), () {
       _isAutoRadarActive = true;
     });
   }
@@ -292,12 +327,81 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
     if (_state != BleConnectionState.connected || _txCharacteristic == null) {
       return false;
     }
-    try {
-      await _txCharacteristic!.write(frameBytes, withoutResponse: true);
-      return true;
-    } catch (_) {
+    bool ok = false;
+    final completer = Completer<bool>();
+    _writeTail = _writeTail.then((_) async {
+      try {
+        if (_state == BleConnectionState.connected && _txCharacteristic != null) {
+          await _txCharacteristic!.write(frameBytes, withoutResponse: true);
+          ok = true;
+          // Gentle pacing for smooth ESP32 Bluedroid RX absorption
+          await Future.delayed(const Duration(milliseconds: 12));
+        }
+      } catch (_) {
+        ok = false;
+      } finally {
+        if (!completer.isCompleted) completer.complete(ok);
+      }
+    });
+    return completer.future;
+  }
+
+  @override
+  Future<bool> sendUrgentPacket(Uint8List frameBytes) async {
+    if (_state != BleConnectionState.connected || _txCharacteristic == null) {
       return false;
     }
+    // Drop stale audio frames if BLE queue backs up (> 6 frames = ~240ms)
+    if (_pendingUrgentWrites >= 6) {
+      return false;
+    }
+    _pendingUrgentWrites++;
+    bool ok = false;
+    final completer = Completer<bool>();
+    _writeTail = _writeTail.then((_) async {
+      try {
+        if (_state == BleConnectionState.connected && _txCharacteristic != null) {
+          await _txCharacteristic!.write(frameBytes, withoutResponse: true);
+          ok = true;
+        }
+      } catch (_) {
+        ok = false;
+      } finally {
+        _pendingUrgentWrites = max(0, _pendingUrgentWrites - 1);
+        if (!completer.isCompleted) completer.complete(ok);
+      }
+    });
+    return completer.future;
+  }
+
+  @override
+  Future<bool> sendReliablePacket(Uint8List frameBytes) async {
+    if (_state != BleConnectionState.connected || _txCharacteristic == null) {
+      return false;
+    }
+    bool ok = false;
+    final completer = Completer<bool>();
+    _writeTail = _writeTail.then((_) async {
+      for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+          if (_state == BleConnectionState.connected && _txCharacteristic != null) {
+            final useWriteWithResponse = _txCharacteristic!.properties.write;
+            await _txCharacteristic!.write(
+              frameBytes,
+              withoutResponse: !useWriteWithResponse,
+            );
+            ok = true;
+            await Future.delayed(const Duration(milliseconds: 8));
+            break;
+          }
+        } catch (_) {
+          ok = false;
+          await Future.delayed(const Duration(milliseconds: 35));
+        }
+      }
+      if (!completer.isCompleted) completer.complete(ok);
+    });
+    return completer.future;
   }
 
   @override
@@ -317,38 +421,89 @@ class FlutterBluePlusBridge implements BleHardwareBridge {
   }
 }
 
-/// High-level BLE Sync Coordinator that bridges [BleHardwareBridge] and [DatabaseService].
-/// Implements Store-and-Forward:
-/// - Auto-flushes local outbox when a node is in range.
-/// - Saves incoming mesh packets and updates SQLite.
-/// - Handles ACK packet receipts.
+class _VoiceAssemblyBuffer {
+  final int totalChunks;
+  final int durationMs;
+  final int codecType;
+  final Map<int, Uint8List> chunks = {};
+
+  _VoiceAssemblyBuffer({
+    required this.totalChunks,
+    required this.durationMs,
+    required this.codecType,
+  });
+
+  bool get isComplete => chunks.length >= totalChunks;
+
+  Uint8List assemble() {
+    final builder = BytesBuilder(copy: false);
+    for (int i = 0; i < totalChunks; i++) {
+      final part = chunks[i];
+      if (part != null) builder.add(part);
+    }
+    return builder.toBytes();
+  }
+}
+
+/// Coordinates Protocol v2 Presence, Peer Directory, Group Sync, Voice Chunking,
+/// Store-and-Forward Outbox, and Live Call Signal/Audio Routing.
 class BleSyncCoordinator {
   final BleHardwareBridge bridge;
   final DatabaseService db;
-  String localNodeId;
-  String activeRecipientId;
+
+  String localDeviceUuid;
+  String localUsername;
+  String localDisplayName;
+  String? activeOpenChatId;
+  bool isAppInForeground = true;
 
   StreamSubscription? _stateSub;
   StreamSubscription? _packetSub;
   bool _isFlushing = false;
+  bool _isRegisteredOnRelay = false;
+
+  final Map<String, _VoiceAssemblyBuffer> _voiceAssemblers = {};
+  final List<DirectoryPeerEntry> _directoryPageAcc = [];
 
   final StreamController<void> _onSyncCompletedController =
       StreamController<void>.broadcast();
+  final StreamController<String> _onNameConflictController =
+      StreamController<String>.broadcast();
+  final StreamController<MessageMail> _onIncomingMessageNotifyController =
+      StreamController<MessageMail>.broadcast();
+  final StreamController<BlePacket> _onCallSignalController =
+      StreamController<BlePacket>.broadcast();
+  final StreamController<BlePacket> _onCallAudioController =
+      StreamController<BlePacket>.broadcast();
+
   Stream<void> get onSyncCompleted => _onSyncCompletedController.stream;
+  Stream<String> get onNameConflict => _onNameConflictController.stream;
+  Stream<MessageMail> get onIncomingMessageNotify =>
+      _onIncomingMessageNotifyController.stream;
+  Stream<BlePacket> get onCallSignal => _onCallSignalController.stream;
+  Stream<BlePacket> get onCallAudio => _onCallAudioController.stream;
+
+  bool get isRegisteredOnRelay => _isRegisteredOnRelay;
 
   BleSyncCoordinator({
     required this.bridge,
     required this.db,
-    this.localNodeId = 'NODE-P1',
-    this.activeRecipientId = 'NODE-P2',
+    required this.localDeviceUuid,
+    required this.localUsername,
+    required this.localDisplayName,
   }) {
-    _stateSub = bridge.stateStream.listen((state) {
+    _stateSub = bridge.stateStream.listen((state) async {
       if (state == BleConnectionState.connected) {
-        // Wait 400ms to ensure GATT notifications & subscriptions are fully live
-        Future.delayed(const Duration(milliseconds: 400), () async {
-          await flushOutbox();
-          await requestMailboxSync();
+        _isRegisteredOnRelay = false;
+        Future.delayed(const Duration(milliseconds: 350), () async {
+          await sendPresenceHello();
         });
+      } else if (state == BleConnectionState.disconnected) {
+        _isRegisteredOnRelay = false;
+        await db.setAllPeersOffline();
+        if (!_onSyncCompletedController.isClosed) {
+          _onSyncCompletedController.add(null);
+        }
       }
     });
 
@@ -357,44 +512,85 @@ class BleSyncCoordinator {
     });
   }
 
-  /// Sends a sync poll packet to the connected relay node.
+  Future<void> sendPresenceHello() async {
+    if (bridge.state != BleConnectionState.connected || localUsername.isEmpty) return;
+    final frame = BlePacketCodec.encodePresenceHello(
+      deviceUuid: localDeviceUuid,
+      username: localUsername,
+      displayName: localDisplayName,
+    );
+    await bridge.sendPacket(frame);
+  }
+
   Future<void> requestMailboxSync() async {
-    if (bridge.state != BleConnectionState.connected) return;
+    if (bridge.state != BleConnectionState.connected || localUsername.isEmpty) return;
     try {
-      final pollFrame = BlePacketCodec.encodePoll(senderId: localNodeId);
+      final pollFrame = BlePacketCodec.encodePoll(senderId: localUsername);
       await bridge.sendPacket(pollFrame);
     } catch (_) {}
   }
 
-  /// Flushes all `PENDING_LOCAL` messages from SQLite to the connected node.
+  Future<void> sendGroupMeta(ChatGroup group) async {
+    if (bridge.state != BleConnectionState.connected) return;
+    final frame = BlePacketCodec.encodeGroupMeta(
+      messageId: group.groupId,
+      senderId: localUsername,
+      groupId: group.groupId,
+      groupName: group.groupName,
+      members: group.members,
+    );
+    await bridge.sendPacket(frame);
+  }
+
+  /// Flushes all `PENDING_LOCAL` messages (including chunked voice notes).
   Future<int> flushOutbox() async {
-    if (bridge.state != BleConnectionState.connected || _isFlushing) {
+    if (bridge.state != BleConnectionState.connected ||
+        _isFlushing ||
+        localUsername.isEmpty) {
       return 0;
     }
     _isFlushing = true;
     int flushedCount = 0;
 
     try {
+      // Ensure ESP32 knows our groups before sending group messages
+      final groups = await db.getGroups();
+      for (final g in groups) {
+        await sendGroupMeta(g);
+      }
+
       final pending = await db.getPendingOutbox();
       for (final msg in pending) {
-        Uint8List frameBytes;
+        bool allSent = true;
         if (msg.payloadType == PayloadType.text) {
-          frameBytes = BlePacketCodec.encodeText(
+          final frameBytes = BlePacketCodec.encodeText(
             messageId: msg.id,
-            recipientId: msg.recipientId,
+            senderId: msg.senderId,
+            targetId: msg.recipientId,
             text: msg.textContent ?? '',
+            isGroup: msg.isGroup,
           );
-        } else {
-          frameBytes = BlePacketCodec.encodeVoice(
+          allSent = await bridge.sendPacket(frameBytes);
+        } else if (msg.payloadType == PayloadType.voiceMail) {
+          final chunks = BlePacketCodec.encodeVoiceChunks(
             messageId: msg.id,
-            recipientId: msg.recipientId,
+            senderId: msg.senderId,
+            targetId: msg.recipientId,
             audioBlob: msg.audioBlob ?? Uint8List(0),
+            durationMs: msg.durationMs,
+            codecType: msg.codecType,
+            isGroup: msg.isGroup,
           );
+          for (final chunkFrame in chunks) {
+            final ok = await bridge.sendPacket(chunkFrame);
+            if (!ok) {
+              allSent = false;
+              break;
+            }
+          }
         }
 
-        final sent = await bridge.sendPacket(frameBytes);
-        if (sent) {
-          // Mark as IN_TRANSIT on successful BLE relay transfer
+        if (allSent) {
           await db.markAsInTransit(msg.id);
           flushedCount++;
         } else {
@@ -411,65 +607,196 @@ class BleSyncCoordinator {
     return flushedCount;
   }
 
-  /// Handles incoming packet from RX notification.
   Future<void> _handleIncomingPacket(BlePacket packet) async {
+    // Fast path: Live Call Audio Frame
+    if (packet.isCallAudio) {
+      if (!_onCallAudioController.isClosed) {
+        _onCallAudioController.add(packet);
+      }
+      return;
+    }
+
+    // Fast path: Call Signaling
+    if (packet.isCallSignal) {
+      if (!_onCallSignalController.isClosed) {
+        _onCallSignalController.add(packet);
+      }
+      return;
+    }
+
+    // Presence Registration Response
+    if (packet.isPresence) {
+      final status = packet.payload.isNotEmpty ? packet.payload[0] : 0x01;
+      if (status == 0x02) {
+        _isRegisteredOnRelay = false;
+        if (!_onNameConflictController.isClosed) {
+          _onNameConflictController.add(localUsername);
+        }
+      } else {
+        _isRegisteredOnRelay = true;
+        final prof = await db.getLocalProfile();
+        if (prof != null && !prof.isVerifiedOnRelay) {
+          await db.saveLocalProfile(prof.copyWith(isVerifiedOnRelay: true));
+        }
+        await requestMailboxSync();
+        await flushOutbox();
+      }
+      if (!_onSyncCompletedController.isClosed) {
+        _onSyncCompletedController.add(null);
+      }
+      return;
+    }
+
+    // Peer Directory Update
+    if (packet.isDirectory) {
+      final dir = BlePacketCodec.decodePeerDirectory(packet.payload);
+      if (dir.page == 0) {
+        _directoryPageAcc.clear();
+      }
+      _directoryPageAcc.addAll(dir.peers);
+      if (dir.page >= dir.totalPages - 1) {
+        await db.upsertPeers(
+          List<DirectoryPeerEntry>.from(_directoryPageAcc),
+          markOthersOffline: true,
+        );
+        _directoryPageAcc.clear();
+        if (!_onSyncCompletedController.isClosed) {
+          _onSyncCompletedController.add(null);
+        }
+      }
+      return;
+    }
+
+    // Group Meta Invitation / Sync
+    if (packet.isGroupMeta) {
+      try {
+        final gm = BlePacketCodec.decodeGroupMeta(packet.targetId, packet.payload);
+        final group = ChatGroup(
+          groupId: gm.groupId,
+          groupName: gm.groupName,
+          createdBy: packet.senderId,
+          createdAt: DateTime.now().millisecondsSinceEpoch,
+          members: gm.members,
+        );
+        await db.saveGroup(group);
+        if (!_onSyncCompletedController.isClosed) {
+          _onSyncCompletedController.add(null);
+        }
+      } catch (_) {}
+      return;
+    }
+
+    // Delivery ACK
     if (packet.isAck) {
-      // End-to-end delivery ACK: status code 0x01 = DELIVERED, 0x02 = FAILED
       final statusCode = packet.payload.isNotEmpty ? packet.payload[0] : 0x01;
       final newStatus = statusCode == 0x01 ? 'DELIVERED' : 'FAILED';
       await db.updateStatusByAck(packet.messageId, newStatus);
       if (!_onSyncCompletedController.isClosed) {
         _onSyncCompletedController.add(null);
       }
-    } else if (packet.isPoll) {
-      // Ignore poll frame on client phone
       return;
-    } else {
-      // Text or Voice message mail delivered to client
-      // Check if this was an outgoing message sent by our own device (prevent echo)
-      final existing = await db.getMessageById(packet.messageId);
-      if (existing != null) {
-        if (existing.senderId == localNodeId) {
-          return;
-        }
-      }
+    }
 
-      // Determine sender: if recipient in packet is our local ID, sender is active conversation partner or source
-      final sender = packet.recipientId == localNodeId ? activeRecipientId : packet.recipientId;
+    if (packet.isPoll) return;
 
+    // Incoming Text or Chunked Voice Mail
+    if (packet.senderId == localUsername) return; // Ignore self echo
+    final existing = await db.getMessageById(packet.messageId);
+    if (existing != null) {
+      // Already received; resend ACK just in case sender missed it
+      await _sendDeliveryAck(packet.messageId, packet.senderId);
+      return;
+    }
+
+    final resolvedChatId = packet.isGroup ? packet.targetId : packet.senderId;
+    final isCurrentlyViewingChat =
+        isAppInForeground && activeOpenChatId == resolvedChatId;
+
+    if (packet.isText) {
       final msg = MessageMail(
         id: packet.messageId,
-        senderId: sender,
-        recipientId: localNodeId,
-        payloadType:
-            packet.isText ? PayloadType.text : PayloadType.voiceMail,
-        textContent: packet.isText ? packet.textContent : null,
-        audioBlob: packet.isVoice ? packet.payload : null,
+        chatId: resolvedChatId,
+        senderId: packet.senderId,
+        recipientId: packet.targetId,
+        isGroup: packet.isGroup,
+        payloadType: PayloadType.text,
+        textContent: packet.textContent,
+        isRead: isCurrentlyViewingChat,
         timestamp: DateTime.now().millisecondsSinceEpoch,
         status: MessageStatus.delivered,
       );
-
       await db.saveIncomingMessage(msg);
+      await _sendDeliveryAck(packet.messageId, packet.senderId);
 
-      // Return an immediate Delivery ACK back to ESP32 / sender
-      try {
-        final ackBytes = BlePacketCodec.encodeAck(
-          messageId: packet.messageId,
-          recipientId: sender,
-          statusCode: 0x01,
-        );
-        await bridge.sendPacket(ackBytes);
-      } catch (_) {}
-
+      if (!isCurrentlyViewingChat && !_onIncomingMessageNotifyController.isClosed) {
+        _onIncomingMessageNotifyController.add(msg);
+      }
       if (!_onSyncCompletedController.isClosed) {
         _onSyncCompletedController.add(null);
       }
+    } else if (packet.isVoice) {
+      try {
+        final chunk = BlePacketCodec.decodeVoiceChunk(packet.payload);
+        final buf = _voiceAssemblers.putIfAbsent(
+          packet.messageId,
+          () => _VoiceAssemblyBuffer(
+            totalChunks: chunk.totalChunks,
+            durationMs: chunk.durationMs,
+            codecType: chunk.codecType,
+          ),
+        );
+        buf.chunks[chunk.chunkIndex] = chunk.chunkBytes;
+
+        if (buf.isComplete) {
+          _voiceAssemblers.remove(packet.messageId);
+          final fullAudio = buf.assemble();
+          final msg = MessageMail(
+            id: packet.messageId,
+            chatId: resolvedChatId,
+            senderId: packet.senderId,
+            recipientId: packet.targetId,
+            isGroup: packet.isGroup,
+            payloadType: PayloadType.voiceMail,
+            audioBlob: fullAudio,
+            durationMs: buf.durationMs,
+            codecType: buf.codecType,
+            isRead: isCurrentlyViewingChat,
+            timestamp: DateTime.now().millisecondsSinceEpoch,
+            status: MessageStatus.delivered,
+          );
+          await db.saveIncomingMessage(msg);
+          await _sendDeliveryAck(packet.messageId, packet.senderId);
+
+          if (!isCurrentlyViewingChat && !_onIncomingMessageNotifyController.isClosed) {
+            _onIncomingMessageNotifyController.add(msg);
+          }
+          if (!_onSyncCompletedController.isClosed) {
+            _onSyncCompletedController.add(null);
+          }
+        }
+      } catch (_) {}
     }
+  }
+
+  Future<void> _sendDeliveryAck(String messageId, String originalSender) async {
+    try {
+      final ackBytes = BlePacketCodec.encodeAck(
+        messageId: messageId,
+        senderId: localUsername,
+        targetId: originalSender,
+        statusCode: 0x01,
+      );
+      await bridge.sendPacket(ackBytes);
+    } catch (_) {}
   }
 
   void dispose() {
     _stateSub?.cancel();
     _packetSub?.cancel();
     _onSyncCompletedController.close();
+    _onNameConflictController.close();
+    _onIncomingMessageNotifyController.close();
+    _onCallSignalController.close();
+    _onCallAudioController.close();
   }
 }

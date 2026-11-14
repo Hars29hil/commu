@@ -1,169 +1,284 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:message_mail/models/message_mail.dart';
+import 'package:message_mail/protocol/ble_packet_codec.dart';
 import 'package:message_mail/providers/message_mail_provider.dart';
 import 'package:message_mail/services/audio_service.dart';
-import 'package:message_mail/services/ble_service.dart';
 import 'package:message_mail/services/database_service.dart';
 import 'package:message_mail/services/mock_ble_node_engine.dart';
-import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 void main() {
-  sqfliteFfiInit();
+  TestWidgetsFlutterBinding.ensureInitialized();
 
-  group('Autonomous MockBleNodeEngine Simulation Tests', () {
+  setUpAll(() {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  });
+
+  group('Protocol v2 End-to-End Mesh Provider Simulations', () {
     late Database rawDb;
     late DatabaseService dbService;
-    late MockBleNodeEngine mockEngine;
     late AudioService audioService;
+    late MockBleNodeEngine mockBridge;
     late MessageMailProvider provider;
 
     setUp(() async {
       rawDb = await databaseFactoryFfi.openDatabase(
         inMemoryDatabasePath,
         options: OpenDatabaseOptions(
-          version: 1,
+          version: DatabaseService.databaseVersion,
+          singleInstance: false,
           onCreate: (db, version) async {
             await DatabaseService.createSchema(db);
           },
         ),
       );
       dbService = DatabaseService(rawDb);
-      mockEngine = MockBleNodeEngine();
       audioService = AudioService();
-
+      mockBridge = MockBleNodeEngine();
       provider = MessageMailProvider(
         db: dbService,
         audio: audioService,
-        bridge: mockEngine,
+        bridge: mockBridge,
+        autoInit: false,
       );
+      await provider.initialize();
     });
 
     tearDown(() async {
       provider.dispose();
+      audioService.dispose();
       await dbService.close();
     });
 
-    test('Scenario 1: Phone out of range -> messages stay buffered in PENDING_LOCAL in SQLite', () async {
-      // 1. Verify initially disconnected
-      expect(provider.isConnected, isFalse);
-      expect(provider.bleState, equals(BleConnectionState.disconnected));
+    test('Unique username registration, relay conflict detection (Option A), and peer discovery', () async {
+      expect(provider.isOnboarded, isFalse);
 
-      // 2. User attempts to send a text message while disconnected
-      await provider.sendTextMessage('Survey team at ridge: No internet, using offline mail.');
+      await mockBridge.connectToNode('OFFGRID-RELAY-DEVKIT');
+      final registered = await provider.registerUsername('Harshil');
+      expect(registered, isTrue);
+      expect(provider.isOnboarded, isTrue);
+      expect(provider.localUsername, equals('harshil'));
 
-      // 3. User records and sends a voice mail while disconnected
-      final voiceBlob = AudioService.generateSyntheticVoiceMail(seconds: 3.0);
-      await provider.sendVoiceMail(voiceBlob);
-
-      // 4. Verify SQLite database holds both messages as PENDING_LOCAL
-      final pendingList = await dbService.getPendingOutbox();
-      expect(pendingList.length, equals(2));
-      expect(pendingList[0].status, equals(MessageStatus.pendingLocal));
-      expect(pendingList[0].payloadType, equals(PayloadType.text));
-      expect(pendingList[1].status, equals(MessageStatus.pendingLocal));
-      expect(pendingList[1].payloadType, equals(PayloadType.voiceMail));
-
-      // 5. Verify nothing was transmitted across BLE yet
-      expect(mockEngine.transmittedFrames, isEmpty);
-      expect(provider.pendingSyncCount, equals(2));
-    });
-
-    test('Scenario 2: Phone connects to Node P1 -> auto-flush outbox to IN_TRANSIT over BLE', () async {
-      // 1. Buffer 2 messages while offline
-      await provider.sendTextMessage('Message 1: Water supply verified.');
-      await provider.sendTextMessage('Message 2: Need relay confirmation.');
-
-      expect(provider.pendingSyncCount, equals(2));
-      expect(mockEngine.transmittedFrames.length, equals(0));
-
-      // 2. Phone comes into Bluetooth range and connects to Node P1
-      final connected = await provider.connectToNode('NODE-P1');
-      expect(connected, isTrue);
-      expect(provider.isConnected, isTrue);
-      expect(provider.connectedNodeName, equals('NODE-P1'));
-
-      // 3. Trigger flush (coordinator triggers automatically on connect event, or via explicit manualMeshSync)
-      await provider.manualMeshSync();
-
-      // 4. Verify mock engine received both framed packets over BLE
-      expect(mockEngine.transmittedPackets.length, equals(2));
-
-      final firstPacket = mockEngine.transmittedPackets[0];
-      expect(firstPacket.isText, isTrue);
-      expect(firstPacket.textContent, equals('Message 1: Water supply verified.'));
-
-      final secondPacket = mockEngine.transmittedPackets[1];
-      expect(secondPacket.isText, isTrue);
-      expect(secondPacket.textContent, equals('Message 2: Need relay confirmation.'));
-
-      // 5. Verify records in SQLite have transitioned from PENDING_LOCAL to IN_TRANSIT
-      final pendingAfterSync = await dbService.getPendingOutbox();
-      expect(pendingAfterSync, isEmpty);
-
-      final allRecords = await dbService.getAllMessages();
-      expect(allRecords.length, equals(2));
-      expect(allRecords[0].status, equals(MessageStatus.inTransit));
-      expect(allRecords[1].status, equals(MessageStatus.inTransit));
-
-      final stats = await dbService.getDatabaseStats();
-      expect(stats['PENDING_LOCAL'], equals(0));
-      expect(stats['IN_TRANSIT'], equals(2));
-    });
-
-    test('Scenario 3: Node pushes incoming buffered message mail -> saves to SQLite and updates UI', () async {
-      // Connect to node
-      await provider.connectToNode('NODE-P1');
-      provider.setActiveRecipient('NODE-P2');
-
-      const incomingMsgId = '99999999-8888-7777-6666-555555555555';
-      const incomingText = 'Heltec Node P1 relaying message from base camp!';
-
-      // Simulate ESP32 node pushing RX packet from the LoRa mesh
-      mockEngine.simulateIncomingText(
-        messageId: incomingMsgId,
-        senderNodeId: 'NODE-P2',
-        text: incomingText,
+      await Future.delayed(const Duration(milliseconds: 30));
+      expect(
+        mockBridge.transmittedPackets.any(
+          (p) => p.isPresence && p.senderId == 'harshil',
+        ),
+        isTrue,
       );
 
-      // Allow async event loop to process
-      await Future.delayed(const Duration(milliseconds: 60));
+      // Relay flags duplicate name conflict -> provider prompts user
+      mockBridge.simulatePresenceConflict('harshil');
+      await Future.delayed(const Duration(milliseconds: 30));
+      expect(provider.nameConflictMessage, isNotNull);
+      expect(provider.nameConflictMessage, contains('harshil'));
 
-      // Verify message saved to SQLite as DELIVERED
-      final savedMessage = await dbService.getMessageById(incomingMsgId);
-      expect(savedMessage, isNotNull);
-      expect(savedMessage!.textContent, equals(incomingText));
-      expect(savedMessage.status, equals(MessageStatus.delivered));
-      expect(savedMessage.senderId, equals('NODE-P2'));
+      // Choosing another unique name clears conflict warning
+      await provider.registerUsername('Harshil_2');
+      await Future.delayed(const Duration(milliseconds: 30));
+      expect(provider.nameConflictMessage, isNull);
+      expect(provider.localUsername, equals('harshil_2'));
 
-      // Verify provider conversation messages refreshed
-      expect(provider.conversationMessages.any((m) => m.id == incomingMsgId), isTrue);
+      // Peer directory sync discovers Taksh & Priya automatically
+      mockBridge.simulatePeerDirectory(const [
+        DirectoryPeerEntry(username: 'harshil_2', displayName: 'Harshil_2', isOnline: true),
+        DirectoryPeerEntry(username: 'taksh', displayName: 'Taksh', isOnline: true),
+        DirectoryPeerEntry(username: 'priya', displayName: 'Priya', isOnline: false),
+      ]);
+      await Future.delayed(const Duration(milliseconds: 30));
+
+      expect(provider.peers.map((p) => p.username), containsAll(['taksh', 'priya']));
+      expect(provider.peers.map((p) => p.username), isNot(contains('harshil_2')));
     });
 
-    test('Scenario 4: LoRa delivery ACK pushes from node -> updates IN_TRANSIT to DELIVERED', () async {
-      await provider.connectToNode('NODE-P1');
+    test('1-to-1 targeted text & chunked voice mail transfer directly by username', () async {
+      await provider.registerUsername('Harshil');
+      await mockBridge.connectToNode('OFFGRID-RELAY-DEVKIT');
+      mockBridge.simulatePeerDirectory(const [
+        DirectoryPeerEntry(username: 'taksh', displayName: 'Taksh', isOnline: true),
+      ]);
+      await Future.delayed(const Duration(milliseconds: 20));
+      mockBridge.clearTransmittedLogs();
 
-      // Send message
-      await provider.sendTextMessage('Packet awaiting mesh round-trip ACK');
-      await provider.manualMeshSync();
+      // Send 1-to-1 text to Taksh
+      await provider.sendTextMessage('taksh', 'Hey Taksh, only you see this!');
+      await Future.delayed(const Duration(milliseconds: 40));
 
-      final inTransitRecords = await dbService.getAllMessages();
-      expect(inTransitRecords.length, equals(1));
-      final msgId = inTransitRecords.first.id;
-      expect(inTransitRecords.first.status, equals(MessageStatus.inTransit));
+      final sentText = mockBridge.transmittedPackets.where((p) => p.isText).toList();
+      expect(sentText.length, equals(1));
+      expect(sentText.first.senderId, equals('harshil'));
+      expect(sentText.first.targetId, equals('taksh'));
+      expect(sentText.first.isGroup, isFalse);
 
-      // Simulate remote recipient sending ACK across the LoRa mesh back to our local node
-      mockEngine.simulateIncomingAck(
-        messageId: msgId,
-        recipientId: provider.localClientId,
-        isDelivered: true,
+      // Simulate delivery ACK from Taksh
+      mockBridge.simulateIncomingAck(
+        messageId: sentText.first.messageId,
+        senderId: 'taksh',
+        targetId: 'harshil',
       );
+      await Future.delayed(const Duration(milliseconds: 30));
 
+      await provider.openChat('taksh');
+      expect(provider.activeChatMessages.length, equals(1));
+      expect(provider.activeChatMessages.first.status, equals(MessageStatus.delivered));
+      provider.closeChat();
+
+      // Receive incoming multi-chunk voice message from Taksh while chat is closed
+      final wavBlob = AudioService.generateTestWavBlob(seconds: 0.25); // 4044 bytes -> multiple chunks
+      mockBridge.simulateIncomingVoice(
+        messageId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        senderId: 'taksh',
+        targetId: 'harshil',
+        audioBlob: wavBlob,
+        durationMs: 250,
+        codecType: VoiceCodecType.wavPcm,
+      );
       await Future.delayed(const Duration(milliseconds: 60));
 
-      // Verify status transitioned to DELIVERED in SQLite
-      final ackedRecord = await dbService.getMessageById(msgId);
-      expect(ackedRecord!.status, equals(MessageStatus.delivered));
+      final takshSummary = provider.chatSummaries.firstWhere((c) => c.chatId == 'taksh');
+      expect(takshSummary.unreadCount, equals(1));
+      expect(takshSummary.lastMessage!.payloadType, equals(PayloadType.voiceMail));
+      expect(takshSummary.lastMessage!.audioBlob, equals(wavBlob));
+    });
+
+    test('Group chat creation syncs metadata and tags group messages correctly', () async {
+      await provider.registerUsername('Harshil');
+      await mockBridge.connectToNode('OFFGRID-RELAY-DEVKIT');
+      mockBridge.clearTransmittedLogs();
+
+      final group = await provider.createGroup(
+        groupName: 'Base Camp',
+        memberUsernames: ['taksh', 'priya'],
+      );
+      expect(group, isNotNull);
+      await Future.delayed(const Duration(milliseconds: 30));
+
+      expect(
+        mockBridge.transmittedPackets.any(
+          (p) => p.isGroupMeta && p.targetId == group!.groupId,
+        ),
+        isTrue,
+      );
+
+      await provider.sendTextMessage(group!.groupId, 'All team check in', isGroup: true);
+      await Future.delayed(const Duration(milliseconds: 40));
+
+      final sentGroupMsg = mockBridge.transmittedPackets.lastWhere((p) => p.isText);
+      expect(sentGroupMsg.isGroup, isTrue);
+      expect(sentGroupMsg.targetId, equals(group.groupId));
+    });
+
+    test('Live Voice Call state machine handles accept/hangup and unanswered voicemail prompt', () async {
+      await provider.registerUsername('Harshil');
+      await mockBridge.connectToNode('OFFGRID-RELAY-DEVKIT');
+      mockBridge.clearTransmittedLogs();
+
+      // Outgoing call -> unavailable triggers unansweredPrompt
+      await provider.startVoiceCall('taksh');
+      expect(provider.callState.phase, equals(CallPhase.calling));
+
+      final invitePkt = mockBridge.transmittedPackets.lastWhere((p) => p.isCallSignal);
+      expect(invitePkt.payload[0], equals(CallSignalCode.invite));
+
+      mockBridge.simulateCallSignal(
+        callId: invitePkt.messageId,
+        senderId: 'taksh',
+        targetId: 'harshil',
+        signalCode: CallSignalCode.unavailable,
+      );
+      await Future.delayed(const Duration(milliseconds: 30));
+      expect(provider.callState.phase, equals(CallPhase.unansweredPrompt));
+
+      // User chooses "Record Voicemail" and sends it
+      provider.openVoicemailRecorderAfterMissedCall();
+      expect(provider.callState.phase, equals(CallPhase.recordingVoicemail));
+
+      final vmBlob = AudioService.generateTestWavBlob(seconds: 0.2);
+      await provider.sendVoicemailFromMissedCall(
+        RecordedVoiceNote(
+          bytes: vmBlob,
+          durationMs: 200,
+          codecType: VoiceCodecType.wavPcm,
+        ),
+      );
+      await Future.delayed(const Duration(milliseconds: 40));
+
+      expect(provider.callState.phase, equals(CallPhase.idle));
+      await provider.openChat('taksh');
+      expect(
+        provider.activeChatMessages.any((m) => m.payloadType == PayloadType.callLog),
+        isTrue,
+      );
+      expect(
+        provider.activeChatMessages.any((m) => m.payloadType == PayloadType.voiceMail),
+        isTrue,
+      );
+    });
+
+    test('Caller transitions to connected on ACCEPT and supports mute, speaker, and hangup', () async {
+      await provider.registerUsername('Harshil');
+      await mockBridge.connectToNode('OFFGRID-RELAY-DEVKIT');
+      mockBridge.clearTransmittedLogs();
+
+      await provider.startVoiceCall('taksh');
+      expect(provider.callState.phase, equals(CallPhase.calling));
+
+      final invitePkt = mockBridge.transmittedPackets.lastWhere((p) => p.isCallSignal);
+      mockBridge.simulateCallSignal(
+        callId: invitePkt.messageId,
+        senderId: 'taksh',
+        targetId: 'harshil',
+        signalCode: CallSignalCode.accept,
+      );
+      await Future.delayed(const Duration(milliseconds: 30));
+
+      expect(provider.callState.phase, equals(CallPhase.connected));
+
+      provider.toggleCallMute();
+      expect(provider.callState.isMuted, isTrue);
+      await provider.toggleCallSpeaker();
+      expect(provider.callState.isSpeakerOn, isTrue);
+
+      await provider.endActiveCall();
+      await Future.delayed(const Duration(milliseconds: 30));
+      expect(provider.callState.phase, equals(CallPhase.idle));
+      expect(
+        mockBridge.transmittedPackets.any(
+          (p) => p.isCallSignal && p.payload.isNotEmpty && p.payload[0] == CallSignalCode.hangup,
+        ),
+        isTrue,
+      );
+    });
+
+    test('Caller auto-promotes to connected and keeps mute/speaker state if audio arrives before ACCEPT', () async {
+      await provider.registerUsername('Harshil');
+      await mockBridge.connectToNode('OFFGRID-RELAY-DEVKIT');
+      mockBridge.clearTransmittedLogs();
+
+      await provider.startVoiceCall('taksh');
+      expect(provider.callState.phase, equals(CallPhase.calling));
+
+      // Caller toggles Mute and Speaker while ringing/calling before ACCEPT arrives
+      provider.toggleCallMute();
+      await provider.toggleCallSpeaker();
+      expect(provider.callState.isMuted, isTrue);
+      expect(provider.callState.isSpeakerOn, isTrue);
+
+      final invitePkt = mockBridge.transmittedPackets.lastWhere((p) => p.isCallSignal);
+      mockBridge.simulateIncomingCallAudio(
+        callId: invitePkt.messageId,
+        senderId: 'taksh',
+        targetId: 'harshil',
+        seqNum: 1,
+      );
+      await Future.delayed(const Duration(milliseconds: 30));
+
+      expect(provider.callState.phase, equals(CallPhase.connected));
+      expect(provider.callState.isMuted, isTrue);
+      expect(provider.callState.isSpeakerOn, isTrue);
+
+      await provider.endActiveCall();
     });
   });
 }
-
